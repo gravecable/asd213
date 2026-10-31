@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { ReactNode } from "react";
-import { BUFFS, HILL_TARGET, HOT_STREAK, MAX_HP, MAX_PLAYERS, MIN_PLAYERS, MODES, MODE_IDS, PLAYER_COLORS, SKINS, SKIN_IDS, buffAt, buffCount, buffIndexAt, roundClock } from "@/game/shared";
+import { BUFFS, HILL_TARGET, HOT_STREAK, MAPS, MAX_HP, MAX_PLAYERS, MIN_PLAYERS, MODES, MODE_IDS, PLAYER_COLORS, SKINS, SKIN_IDS, buffAt, buffCount, buffIndexAt, roundClock } from "@/game/shared";
 import type { BuffId, GameMode, PlayerInfo, SkinId, TrainStats } from "@/game/shared";
 import { Engine, SENS_MAX, SENS_MIN } from "@/game/client/engine";
 import { createStore, initialUi } from "@/game/client/store";
@@ -279,6 +279,11 @@ function TopBar({ ui, now }: { ui: UiState; now: number }) {
       </div>
       <div className="flex flex-wrap items-center justify-center gap-2 text-sm">
         {ui.mode !== "classic" && <ModeBadge mode={ui.mode} />}
+        {ui.map && (
+          <span className="pvp-badge" style={{ borderColor: MAPS[ui.map].color, color: MAPS[ui.map].color }}>
+            {MAPS[ui.map].title}
+          </span>
+        )}
         {ui.buffs.length > 1 && <span className="pvp-badge pvp-pulse border-fuchsia-400 text-fuchsia-300">ХАОС</span>}
         {ui.buffs.length ? (
           ui.buffs.map((b) => (
@@ -461,7 +466,8 @@ function BigCount({ text, sub }: { text: string; sub?: string }) {
 function Countdown({ ui, now }: { ui: UiState; now: number }) {
   const elapsed = Math.max(0, now - ui.phaseStartedAt);
   if (ui.phase === "countdown") {
-    return <BigCount text={String(Math.max(1, Math.ceil((ui.timings.countdownMs - elapsed) / 1000)))} sub="Высадка на арену!" />;
+    const map = ui.map ? MAPS[ui.map] : null;
+    return <BigCount text={String(Math.max(1, Math.ceil((ui.timings.countdownMs - elapsed) / 1000)))} sub={map ? `Карта «${map.title}» · ${map.description}` : "Высадка на арену!"} />;
   }
   if (ui.phase === "playing" && elapsed < 1200) return <BigCount text="БОЙ!" />;
   return null;
@@ -707,7 +713,8 @@ function HubStatus({ ui, now }: { ui: UiState; now: number }) {
     return (
       <Panel className="!px-4 !py-2 text-center">
         <div className="text-base">
-          Идёт раунд · <b style={{ color: MODES[ui.mode].color }}>{MODES[ui.mode].title}</b> · {clock.overtime ? "овертайм " : ""}
+          Идёт раунд · <b style={{ color: MODES[ui.mode].color }}>{MODES[ui.mode].title}</b>
+          {ui.map && <> · {MAPS[ui.map].title}</>} · {clock.overtime ? "овертайм " : ""}
           {fmt(clock.left)} · живых{" "}
           <b className="text-[#7CFC00]">{alive}</b>/{participants.length}
         </div>

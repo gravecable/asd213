@@ -37,7 +37,7 @@ export const HOT_STREAK = 3;
 export const TICK_MS = 50;
 
 /** Bumped whenever the wire format changes; outdated clients are asked to reload. */
-export const PROTOCOL_VERSION = 6;
+export const PROTOCOL_VERSION = 7;
 
 /** WebSocket close codes the server uses to explain why it dropped a client. */
 export const CLOSE_OUTDATED = 4000;
@@ -98,6 +98,8 @@ export interface Timings {
   lobbyMs: number;
   /** …or this soon once more than half of them stand in the ready circle. */
   readyMs: number;
+  /** Maps: a new chest turns up this often (while there are fewer than CHEST_MAX). */
+  chestMs: number;
 }
 
 export function makeTimings(scale = 1): Timings {
@@ -118,6 +120,7 @@ export function makeTimings(scale = 1): Timings {
     hillPointMs: 1000 * scale,
     lobbyMs: 60_000 * scale,
     readyMs: 10_000 * scale,
+    chestMs: 20_000 * scale,
   };
 }
 
@@ -479,6 +482,34 @@ export interface Vec3 {
   z: number;
 }
 
+/** Chest loot (rounds on a map): one slot per kind, `count` per chest, `max` held. */
+export type ItemId = "apple" | "pearl" | "shield" | "snowball" | "tnt";
+export const ITEM_IDS: ItemId[] = ["apple", "pearl", "shield", "snowball", "tnt"];
+export const ITEMS: Record<ItemId, { title: string; hint: string; color: string; count: number; max: number }> = {
+  apple: { title: "Золотое яблоко", hint: "лечит 4 сердца", color: "#facc15", count: 1, max: 3 },
+  pearl: { title: "Эндер-жемчуг", hint: "брось — окажешься там, где он упадёт", color: "#2dd4bf", count: 1, max: 3 },
+  shield: { title: "Щит", hint: "поглощает следующий удар", color: "#93c5fd", count: 1, max: 2 },
+  snowball: { title: "Снежки", hint: "не ранят, но отталкивают", color: "#e2e8f0", count: 6, max: 16 },
+  tnt: { title: "Динамит", hint: "ставится как блок, взрыв через 3 с", color: "#ef4444", count: 1, max: 3 },
+};
+export interface ChestInfo {
+  id: number;
+  x: number;
+  y: number;
+  z: number;
+}
+/** Chests on the island at most. */
+export const CHEST_MAX = 6;
+export const APPLE_HEAL = 8;
+/** A raised shield lasts this long unless a hit lands on it first. */
+export const SHIELD_MS = 12_000;
+export const TNT_FUSE_MS = 3000;
+/** Thrown snowballs and pearls: launch speed and gravity (the client draws them in between ticks). */
+export const THROW_SPEED = 24;
+export const THROW_GRAVITY = 16;
+/** Kinds of thrown things in `tick.j`. */
+export const THROWN: ItemId[] = ["snowball", "pearl"];
+
 /** Moves `pos` (the feet) along one axis, testing only the cells the leading face enters (blocks
  *  overlapping the player — e.g. placed at their feet — therefore never teleport them).
  *  Returns true when a solid cell stopped the move. */
@@ -752,6 +783,8 @@ export interface PlayerInfo {
   maxHp: number;
   /** King of the Hill points. */
   score: number;
+  /** Holds up a shield (chest item). */
+  shield: boolean;
 }
 
 // ---------------------------------------------------------------- hub
@@ -965,7 +998,13 @@ export type ClientMsg =
   /** Bows buff: shoot an arrow along this view (from the server's position for the player). */
   | { t: "shoot"; yaw: number; pitch: number; tk: number }
   /** An eliminated player votes for the next buff (index into `buffVote.options`). */
-  | { t: "buffVote"; i: number };
+  | { t: "buffVote"; i: number }
+  /** Uses an item along this view; `at`: the cell a TNT goes into (like `place`). */
+  | { t: "use"; item: ItemId; yaw: number; pitch: number; tk: number; at?: [number, number, number] };
+
+/** `chest` opened, `eat`, `throw`, `shield` raised, `block`: a shield took a hit, `pearl`: arrived,
+ *  `splash`: a snowball burst, `fizzle`: a pearl got lost. */
+export type ItemFx = "chest" | "eat" | "throw" | "shield" | "block" | "pearl" | "splash" | "fizzle";
 
 export interface DailyRecords {
   /** Moscow date, YYYY-MM-DD. */
@@ -1036,9 +1075,10 @@ export type ServerMsg =
   /** `s`: tick number. `p`: flat [id, x, y, z, yaw, pitch, hp, ...] for the players this client may see
    *  in its world. Hub only: `m` mobs [id, kindIndex, x, y, z, yaw, hp, maxHp, ...] and `a` arrows
    *  [id, x, y, z, vx, vy, vz, ...]. */
-  | { t: "tick"; s: number; p: number[]; m?: number[]; a?: number[] }
-  /** `respawnIn`: ms until the player is back (respawn modes), 0 otherwise. */
-  | { t: "you"; hp: number; maxHp: number; dirt: number; arrows: number; alive: boolean; role: Role; watching: boolean; respawnIn: number }
+  | { t: "tick"; s: number; p: number[]; m?: number[]; a?: number[]; j?: number[] }
+  /** `respawnIn`: ms until the player is back (respawn modes), 0 otherwise. `items`: held chest loot
+   *  in pickup order. */
+  | { t: "you"; hp: number; maxHp: number; dirt: number; arrows: number; alive: boolean; role: Role; watching: boolean; respawnIn: number; items: [ItemId, number][] }
   /** Authoritative position; `yaw` only on spawn, server corrections keep the player's view. */
   | { t: "tp"; x: number; y: number; z: number; n: number; yaw?: number }
   /** `kn`: the victim's knockback number (0 without knockback), echoed back in `move.k`. */
@@ -1058,13 +1098,18 @@ export type ServerMsg =
   | { t: "bomb"; holder: number | null; ms: number }
   /** A meteor lands at x, y, z in `ms` (radius `r`). */
   | { t: "meteor"; id: number; x: number; y: number; z: number; r: number; ms: number }
-  | { t: "boom"; x: number; y: number; z: number; r: number; kind: "bomb" | "meteor" }
+  | { t: "boom"; x: number; y: number; z: number; r: number; kind: "bomb" | "meteor" | "tnt" }
   /** Mode scores: team kills (Teams) or survivors per team (Infection), the target, King of the
    *  Hill's holder (null: nobody or contested). */
   | { t: "score"; teams: number[]; target: number; hill: number | null; contested: boolean }
   /** Eliminated players choose the next buff; `options` empty when no vote is open. */
   | { t: "buffVote"; options: BuffId[]; votes: number[]; ms: number; mine: number | null }
   | { t: "bags"; bags: BagInfo[] }
+  | { t: "chests"; chests: ChestInfo[] }
+  /** Lit TNT on the island; `ms` till each goes off. */
+  | { t: "tnt"; tnts: { id: number; x: number; y: number; z: number; ms: number }[] }
+  /** Something happened with an item at x, y, z (sounds and particles). `id`: who did it. */
+  | { t: "fx"; fx: ItemFx; id: number; x: number; y: number; z: number }
   | { t: "pong"; id: number }
   /** Lobby state, sent to everyone a few times a second. `startIn`: ms until the round starts (null:
    *  waiting for players); `votes` in MODE_IDS order. */

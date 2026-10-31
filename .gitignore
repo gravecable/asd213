@@ -1,0 +1,11 @@
+node_modules/
+.next/
+out/
+build/
+*.tsbuildinfo
+.env*.local
+.hoplite/artifacts/
+.hoplite/runtime/
+
+# daily records written by the game server
+/data/

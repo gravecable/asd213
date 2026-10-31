@@ -1,0 +1,35 @@
+{
+  "name": "blok-arena",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON server/index.ts",
+    "dev:next": "next dev",
+    "build": "next build",
+    "start": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON server/index.ts --prod",
+    "game": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON server/index.ts --game-only",
+    "lint": "eslint",
+    "test:anticheat": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test server/anticheat.test.ts",
+    "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test server/*.test.ts",
+    "test:hub": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test server/hub.test.ts"
+  },
+  "dependencies": {
+    "next": "16.3.4",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "three": "^0.186.1",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@types/three": "^0.186.0",
+    "@types/ws": "^8.18.1",
+    "eslint": "^9",
+    "eslint-config-next": "16.3.4",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}

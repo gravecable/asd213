@@ -37,7 +37,7 @@ export const HOT_STREAK = 3;
 export const TICK_MS = 50;
 
 /** Bumped whenever the wire format changes; outdated clients are asked to reload. */
-export const PROTOCOL_VERSION = 5;
+export const PROTOCOL_VERSION = 6;
 
 /** WebSocket close codes the server uses to explain why it dropped a client. */
 export const CLOSE_OUTDATED = 4000;
@@ -255,6 +255,17 @@ export const TEAM_KILLS_PER_PLAYER = 4;
 /** Spleef: two snow layers; players start on the upper one. */
 export const SPLEEF_LAYERS = [0, 4];
 
+/** Arena maps: every round the server generates a fresh layout of one of these themes (Sumo and
+ *  Spleef keep their bare platforms). */
+export type MapId = "meadow" | "ruins" | "canyon" | "winter";
+export const MAP_IDS: MapId[] = ["meadow", "ruins", "canyon", "winter"];
+export const MAPS: Record<MapId, { title: string; description: string; color: string }> = {
+  meadow: { title: "Луга", description: "Холмы, рощи и валуны", color: "#86efac" },
+  ruins: { title: "Руины", description: "Разрушенные стены, колонны и сторожевые вышки", color: "#fca5a5" },
+  canyon: { title: "Ущелье", description: "Пропасть через остров, узкие мосты и скалы", color: "#fdba74" },
+  winter: { title: "Зима", description: "Снежные холмы, ели и провалы", color: "#bae6fd" },
+};
+
 /** Giants and small ones (the giants buff). Collision boxes stay the same; hit boxes, eyes, reach,
  *  speed, damage, health and knockback follow the size. */
 export const GIANT_SIZE = 1.6;
@@ -354,10 +365,12 @@ export function cellInRing(x: number, z: number, radius: number): boolean {
   return cx * cx + cz * cz <= radius * radius;
 }
 
-/** Voxel storage for player-placed blocks (the floor is implicit and unbreakable). */
+/** Voxel storage for blocks (the floor is implicit and unbreakable). */
 export class Voxels {
   readonly data = new Uint8Array(GRID * GRID * MAX_HEIGHT);
   readonly filled = new Set<number>();
+  /** Floor cells missing from the island (the map's ravines and sinkholes), by `Voxels.cell`. */
+  readonly holes = new Set<number>();
   /** The floor covers the cells whose centre lies within this radius; past it is a sheer drop.
    *  Infinite in the hub (its edge is a wall), the arena's island crumbles during a round. */
   floorRadius = Infinity;
@@ -368,6 +381,11 @@ export class Voxels {
 
   static index(x: number, y: number, z: number): number {
     return (y * GRID + (z + ARENA_RADIUS)) * GRID + (x + ARENA_RADIUS);
+  }
+
+  /** Key of a floor cell; the same as the index of its y = 0 voxel. */
+  static cell(x: number, z: number): number {
+    return (z + ARENA_RADIUS) * GRID + (x + ARENA_RADIUS);
   }
 
   static decode(i: number): [number, number, number] {
@@ -392,9 +410,29 @@ export class Voxels {
 
   /** Solid for movement: blocks, the floor (y < 0, where there is one) and the ceiling (y >= MAX_HEIGHT). */
   solid(x: number, y: number, z: number): boolean {
-    if (y < 0) return cellInRing(x, z, this.floorRadius);
+    if (y < 0) return this.floored(x, z);
     if (y >= MAX_HEIGHT) return true;
     return this.get(x, y, z) !== 0;
+  }
+
+  /** Whether there is floor under cell x, z. */
+  floored(x: number, z: number): boolean {
+    return cellInRing(x, z, this.floorRadius) && !(this.holes.size && this.holes.has(Voxels.cell(x, z)));
+  }
+
+  /** Flat [x, z, x, z, ...] list of the holes in the floor. */
+  holeList(): number[] {
+    const out: number[] = [];
+    for (const i of this.holes) {
+      const [x, , z] = Voxels.decode(i);
+      out.push(x, z);
+    }
+    return out;
+  }
+
+  setHoles(list: readonly number[]): void {
+    this.holes.clear();
+    for (let i = 0; i + 1 < list.length; i += 2) if (cellInRing(list[i], list[i + 1], ARENA_RADIUS)) this.holes.add(Voxels.cell(list[i], list[i + 1]));
   }
 
   /** The same blocks (shared storage) over a floor of another radius. */
@@ -407,6 +445,7 @@ export class Voxels {
   clear(): void {
     this.data.fill(0);
     this.filled.clear();
+    this.holes.clear();
   }
 
   /** Flat [x, y, z, x, y, z, ...] list of filled cells. */
@@ -425,8 +464,14 @@ export class Voxels {
 }
 
 /** Block types (the value stored in Voxels). Players only ever place dirt. */
-export const BLOCK = { dirt: 1, stone: 2, planks: 3, gold: 4, obsidian: 5, bricks: 6, bone: 7, snow: 8 } as const;
-export const BLOCK_TYPES = 8;
+export const BLOCK = { dirt: 1, stone: 2, planks: 3, gold: 4, obsidian: 5, bricks: 6, bone: 7, snow: 8, grass: 9, log: 10, leaves: 11 } as const;
+export const BLOCK_TYPES = 11;
+
+/** What players may break in the arena: dirt (it goes back into their stock) and snow. The map's
+ *  other blocks only go in blasts. */
+export function breakable(type: number): boolean {
+  return type === BLOCK.dirt || type === BLOCK.snow;
+}
 
 export interface Vec3 {
   x: number;
@@ -980,10 +1025,13 @@ export type ServerMsg =
       /** Current radius of the arena's island. */
       floor: number;
       winTeam: number | null;
+      /** The round's map (null: a bare island, or no round). */
+      map: MapId | null;
     }
   | { t: "buff"; buffs: BuffId[] }
-  /** The world the client is now in, as [x, y, z, type, ...]; a `tp` into it follows. */
-  | { t: "world"; w: View; blocks: number[] }
+  /** The world the client is now in, as [x, y, z, type, ...]; a `tp` into it follows. Arena only:
+   *  `holes` in its floor as [x, z, ...]. */
+  | { t: "world"; w: View; blocks: number[]; holes?: number[] }
   | { t: "block"; w: View; x: number; y: number; z: number; v: number }
   /** `s`: tick number. `p`: flat [id, x, y, z, yaw, pitch, hp, ...] for the players this client may see
    *  in its world. Hub only: `m` mobs [id, kindIndex, x, y, z, yaw, hp, maxHp, ...] and `a` arrows

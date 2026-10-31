@@ -1,5 +1,5 @@
 import { ARENA_RADIUS, makeTimings } from "../shared";
-import type { BuffId, DailyRecords, GameMode, KillReason, Phase, PlayerInfo, Role, RoundResult, SkinId, Timings, TrainStats, View } from "../shared";
+import type { BuffId, DailyRecords, GameMode, KillReason, MapId, Phase, PlayerInfo, Role, RoundResult, SkinId, Timings, TrainStats, View } from "../shared";
 
 export type SpecMode = "free" | "first" | "third";
 
@@ -36,6 +36,8 @@ export interface UiState {
   timings: Timings;
   /** Mode of the current (or last) round. */
   mode: GameMode;
+  /** The arena round's map (null: a bare island). */
+  map: MapId | null;
   players: PlayerInfo[];
   /** Active buffs: one, two in the Chaos finale. */
   buffs: BuffId[];
@@ -122,6 +124,7 @@ export const initialUi = (): UiState => ({
   phaseStartedAt: 0,
   timings: makeTimings(),
   mode: "classic",
+  map: null,
   players: [],
   buffs: [],
   announce: null,

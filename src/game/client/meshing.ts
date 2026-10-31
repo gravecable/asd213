@@ -1,5 +1,6 @@
 import * as THREE from "three";
-import { ARENA_RADIUS, BLOCK_TYPES, SPAWN_RADIUS, Voxels, cellInRing } from "../shared";
+import { ARENA_RADIUS, BLOCK, BLOCK_TYPES, SPAWN_RADIUS, Voxels, cellInRing } from "../shared";
+import { ATLAS_TILES, TILE } from "./textures";
 
 const R = ARENA_RADIUS;
 /** Vertex brightness by ambient-occlusion level (0 = most occluded), Minecraft-style. */
@@ -11,7 +12,8 @@ const UV = [
   [0, 1],
 ];
 
-const occupied = (w: Voxels, x: number, y: number, z: number) => (y < 0 ? cellInRing(x, z, R) : w.get(x, y, z) !== 0);
+const NO_HOLES: ReadonlySet<number> = new Set();
+const occupied = (w: Voxels, x: number, y: number, z: number) => (y < 0 ? cellInRing(x, z, R) && !w.holes.has(Voxels.cell(x, z)) : w.get(x, y, z) !== 0);
 const aoLevel = (s1: boolean, s2: boolean, c: boolean) => (s1 && s2 ? 0 : 3 - (Number(s1) + Number(s2) + Number(c)));
 
 export class GeometryBuilder {
@@ -64,15 +66,16 @@ const TOP_CORNERS = [
 ];
 
 /** Floor slab: one quad per island cell (vertex colours carry contact AO), plus a blocky island edge.
- *  `radius`: the arena's island crumbles during a round. */
-export function buildFloor(radius = R): Floor {
+ *  `radius`: the arena's island crumbles during a round; `holes`: cells missing from it (by
+ *  `Voxels.cell`), edged like the rim. */
+export function buildFloor(radius = R, holes: ReadonlySet<number> = NO_HOLES): Floor {
   const top = new GeometryBuilder();
   const ring = new GeometryBuilder();
   const side = new GeometryBuilder();
   const dirt = new GeometryBuilder();
   const topCells: number[][] = [];
   const ringCells: number[][] = [];
-  const inside = (x: number, z: number) => cellInRing(x, z, radius);
+  const inside = (x: number, z: number) => cellInRing(x, z, radius) && !holes.has(Voxels.cell(x, z));
   const ones = [1, 1, 1, 1];
   for (let x = -R - 1; x <= R; x++) {
     for (let z = -R - 1; z <= R; z++) {
@@ -173,11 +176,19 @@ const FACE_CORNERS = [
 /** Inset (in tile fractions) that keeps nearest-filtered samples from landing on a neighbouring atlas tile. */
 const TILE_INSET = 0.004;
 
-/** Maps a 0..1 face UV into the atlas tile of a block type; unknown types fall back to dirt. */
-function atlasUv(type: number, u: number, v: number) {
-  const tile = type >= 1 && type <= BLOCK_TYPES ? type - 1 : 0;
+/** Maps a 0..1 face UV into an atlas tile. */
+function atlasUv(tile: number, u: number, v: number) {
   const span = 1 - 2 * TILE_INSET;
-  return [(tile + TILE_INSET + u * span) / BLOCK_TYPES, TILE_INSET + v * span];
+  return [(tile + TILE_INSET + u * span) / ATLAS_TILES, TILE_INSET + v * span];
+}
+
+/** Atlas tile of a block's face (`axis` 1 is up/down, `s` its sign): grass has a grassy top, a dirt
+ *  bottom and grass-edged sides, logs show their rings at the ends. Unknown types look like dirt. */
+function faceTile(type: number, axis: number, s: number) {
+  if (type === BLOCK.grass && axis !== 1) return TILE.grassSide;
+  if (type === BLOCK.grass && s < 0) return BLOCK.dirt - 1;
+  if (type === BLOCK.log && axis === 1) return TILE.logTop;
+  return type >= 1 && type <= BLOCK_TYPES ? type - 1 : 0;
 }
 
 /** Meshes player blocks: hidden faces culled, per-vertex ambient occlusion in vertex colours. */
@@ -194,6 +205,7 @@ export function buildBlockGeometry(world: Voxels) {
         if (occupied(world, l[0], l[1], l[2])) continue;
         const u = (axis + 1) % 3;
         const v = (axis + 2) % 3;
+        const tile = faceTile(type, axis, s);
         const corners: number[][] = [];
         const uvs: number[][] = [];
         const ao: number[] = [];
@@ -204,7 +216,7 @@ export function buildBlockGeometry(world: Voxels) {
           q[u] += cu;
           q[v] += cv;
           corners.push(q);
-          uvs.push(axis === 0 ? atlasUv(type, cv, cu) : atlasUv(type, cu, cv));
+          uvs.push(axis === 0 ? atlasUv(tile, cv, cu) : atlasUv(tile, cu, cv));
           const du = cu ? 1 : -1;
           const dv = cv ? 1 : -1;
           const s1 = [...l];

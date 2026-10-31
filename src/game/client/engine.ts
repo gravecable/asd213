@@ -2,6 +2,7 @@ import * as THREE from "three";
 import {
   ARENA_RADIUS,
   BLOCK,
+  breakable,
   BUFF_IDS,
   BUILD_REACH,
   CLOSE_BANNED,
@@ -248,8 +249,11 @@ export class Engine {
   private world = new Voxels();
   private tex = createTextures();
   private floor = buildFloor();
-  /** Island radius the floor meshes were built for, and the meshes: top, stone ring, side, dirt. */
+  /** Island radius and holes (`holesVersion` bumps with every new set) the floor meshes were built
+   *  for, and the meshes: top, stone ring, side, dirt. */
   private floorBuiltR = ARENA_RADIUS;
+  private holesVersion = 0;
+  private floorBuiltHoles = 0;
   private floorMeshes: THREE.Mesh[] = [];
   /** Cells about to crumble flash red. */
   private crumbleMat = new THREE.MeshBasicMaterial({ color: "#ff1a1a", transparent: true, opacity: 0.6, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
@@ -788,6 +792,7 @@ export class Engine {
           buffs: m.buffs,
           winTeam: m.winTeam,
           mode: m.mode,
+          map: m.map,
           winnerId: m.winner,
           winnerName: m.winnerName,
           pointsWin: m.pointsWin,
@@ -817,7 +822,7 @@ export class Engine {
         }
         break;
       case "world":
-        this.enterWorld(m.w, m.blocks);
+        this.enterWorld(m.w, m.blocks, m.holes ?? []);
         break;
       case "floor":
         this.onFloor(m, now);
@@ -1008,7 +1013,7 @@ export class Engine {
     this.blocksDirty = true;
     this.floorAoDirty = "all";
     // Debris over a sample of the fallen cells, a rumble and a shake.
-    const band = bandCells(prev, m.r);
+    const band = bandCells(prev, m.r).filter(([x, z]) => !this.world.holes.has(Voxels.cell(x, z)));
     let nearest: THREE.Vector3 | null = null;
     for (let n = 0; n < 30 && band.length; n++) {
       const [x, z] = band.splice(Math.floor(Math.random() * band.length), 1)[0];
@@ -1097,17 +1102,18 @@ export class Engine {
     const island = arena ? s.floor : ARENA_RADIUS;
     this.world.floorRadius = arena ? (spleef ? 0 : s.floor) : Infinity;
     const r = spleef ? 0 : island;
-    if (r !== this.floorBuiltR) {
+    if (r !== this.floorBuiltR || this.holesVersion !== this.floorBuiltHoles) {
       this.floorBuiltR = r;
+      this.floorBuiltHoles = this.holesVersion;
       const old = this.floor;
-      this.floor = buildFloor(r);
+      this.floor = buildFloor(r, this.world.holes);
       const [top, ring, side, dirt] = this.floorMeshes;
       top.geometry = this.floor.top;
       ring.geometry = this.floor.ring;
       side.geometry = this.floor.side;
       dirt.geometry = this.floor.dirt;
       for (const g of [old.top, old.ring, old.side, old.dirt]) g.dispose();
-      this.scenery.setIslandRadius(r);
+      this.scenery.setIsland(r, this.world.holes, this.holesVersion);
       this.floorAoDirty = "all";
       this.blocksDirty = true;
     }
@@ -1117,6 +1123,7 @@ export class Engine {
       this.crumbleKey = key;
       const g = new GeometryBuilder();
       for (const [x, z] of c ? bandCells(island, c.next) : []) {
+        if (this.world.holes.has(Voxels.cell(x, z))) continue;
         const y = spleef ? SPLEEF_LAYERS[1] + 1.02 : 0.02;
         g.quad(
           [
@@ -1138,10 +1145,12 @@ export class Engine {
   }
 
   /** The server moved us into another world (hub ↔ arena): start from a clean scene. */
-  private enterWorld(w: UiState["view"], blocks: number[]) {
+  private enterWorld(w: UiState["view"], blocks: number[], holes: number[]) {
     this.clearWorldObjects();
     this.world.clear();
     for (let i = 0; i + 3 < blocks.length; i += 4) this.world.set(blocks[i], blocks[i + 1], blocks[i + 2], blocks[i + 3]);
+    this.world.setHoles(holes);
+    this.holesVersion++;
     this.floorAoDirty = "all";
     this.blocksDirty = true;
     this.fireworks.clear();
@@ -1813,9 +1822,10 @@ export class Engine {
     this.send({ t: "place", x, y, z });
   }
 
-  /** In the hub only blocks players placed in the build area can go (they are all dirt). */
+  /** In the arena players break dirt and snow (the map's other blocks only go in blasts); in the hub
+   *  only the blocks they placed in the build area (they are all dirt). */
   private canBreak(b: VoxelHit) {
-    if (this.store.get().view === "arena") return true;
+    if (this.store.get().view === "arena") return breakable(this.world.get(b.x, b.y, b.z));
     return this.world.get(b.x, b.y, b.z) === BLOCK.dirt && inCellBox(b.x, b.z, HUB.build);
   }
 

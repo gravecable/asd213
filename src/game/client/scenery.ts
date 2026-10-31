@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import { ARENA_RADIUS, cellInRing } from "../shared";
+import { ARENA_RADIUS, Voxels, cellInRing } from "../shared";
 import { GeometryBuilder } from "./meshing";
 import { sceneryTextures } from "./textures";
 
@@ -138,13 +138,13 @@ class Mesher {
 const key = (x: number, z: number) => (x + 512) * 2048 + (z + 512);
 
 /** The rock under the arena slab: deepest in the middle, a few blocks at the rim. Cut off at `radius`
- *  as the island crumbles, so the cut shows as a cliff. */
-function islandUnderside(m: Mesher, radius: number) {
+ *  as the island crumbles, so the cut shows as a cliff; holes in the floor go right through it. */
+function islandUnderside(m: Mesher, radius: number, holes: ReadonlySet<number>) {
   const n = valueNoise(3);
   const depth = new Map<number, number>();
   for (let x = -R - 1; x <= R; x++) {
     for (let z = -R - 1; z <= R; z++) {
-      if (!cellInRing(x, z, radius)) continue;
+      if (!cellInRing(x, z, radius) || holes.has(Voxels.cell(x, z))) continue;
       const t = Math.max(0, 1 - Math.hypot(x + 0.5, z + 0.5) / R);
       depth.set(key(x, z), 1 + Math.round(30 * Math.pow(t, 1.5) + 7 * t * n(x * 0.12, z * 0.12) + 2 * n(x * 0.5 + 40, z * 0.5)));
     }
@@ -239,7 +239,7 @@ export class Scenery {
   private readonly water: THREE.Texture;
   private readonly rockMat: THREE.MeshLambertMaterial;
   private underside: THREE.Mesh | null = null;
-  private undersideR = -1;
+  private undersideKey = "";
 
   constructor(sunPos: THREE.Vector3) {
     const tex = sceneryTextures();
@@ -277,7 +277,7 @@ export class Scenery {
     sea.position.y = SEA_Y;
 
     this.rockMat = new THREE.MeshLambertMaterial({ map: tex.stone, vertexColors: true });
-    this.setIslandRadius(R);
+    this.setIsland(R, new Set(), 0);
     const m = new Mesher();
     const rnd = rng(2024);
     // Big islands on the horizon (hazy in the fog), small rocks floating closer and lower.
@@ -309,17 +309,18 @@ export class Scenery {
     this.group.add(this.sky, sea);
   }
 
-  /** Rebuilds the rock under the island for its current radius. */
-  setIslandRadius(r: number) {
-    if (r === this.undersideR) return;
-    this.undersideR = r;
+  /** Rebuilds the rock under the island for its current radius and holes (`version` changes with them). */
+  setIsland(r: number, holes: ReadonlySet<number>, version: number) {
+    const key = `${r}:${version}`;
+    if (key === this.undersideKey) return;
+    this.undersideKey = key;
     if (this.underside) {
       this.group.remove(this.underside);
       this.underside.geometry.dispose();
       this.underside = null;
     }
     const m = new Mesher();
-    islandUnderside(m, r);
+    islandUnderside(m, r, holes);
     const rock = m.builders.get("stone");
     if (!rock) return;
     this.underside = new THREE.Mesh(rock.build(), this.rockMat);

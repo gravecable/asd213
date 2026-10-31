@@ -130,6 +130,41 @@ function drawSnowTile(ctx: CanvasRenderingContext2D) {
   for (let i = 0; i < 18; i++) rect(ctx, pick(r, ["#c9d9e8", "#b9cde0", "#d6e3ef"]), Math.floor(r() * 16), Math.floor(r() * 16), 1, 1);
 }
 
+function drawGrassTopTile(ctx: CanvasRenderingContext2D) {
+  noise(ctx, 7, GRASS);
+}
+
+function drawGrassSideTile(ctx: CanvasRenderingContext2D) {
+  noise(ctx, 3, DIRT);
+  const r = rng(11);
+  for (let x = 0; x < 16; x++) {
+    const depth = 3 + Math.floor(r() * 3);
+    for (let y = 0; y < depth; y++) rect(ctx, pick(r, GRASS), x, y, 1, 1);
+  }
+}
+
+function drawLogTile(ctx: CanvasRenderingContext2D) {
+  noise(ctx, 31, BARK);
+  const r = rng(32);
+  for (let x = 1; x < 16; x += 4) for (let y = 0; y < 16; y++) if (r() < 0.7) rect(ctx, "#3e2c16", x, y, 1, 1);
+}
+
+/** A log's cut end: growth rings inside the bark. */
+function drawLogTopTile(ctx: CanvasRenderingContext2D) {
+  noise(ctx, 33, BARK);
+  noise(ctx, 34, ["#b4915a", "#a8854f", "#bf9c63"], 1, 15);
+  rect(ctx, "#6b4f2a", 0, 0, 1, 16);
+  rect(ctx, "#6b4f2a", 15, 0, 1, 16);
+  ctx.strokeStyle = "#8a6a3c";
+  ctx.lineWidth = 1;
+  for (const s of [3, 7, 11]) ctx.strokeRect(8 - s / 2 + 0.5, 8 - s / 2 + 0.5, s - 1, s - 1);
+}
+
+function drawLeavesTile(ctx: CanvasRenderingContext2D) {
+  noise(ctx, 37, LEAVES);
+  speckle(ctx, 41, ["rgba(0,0,0,0)", "rgba(0,0,0,0)", "rgba(0,0,0,0)", "rgba(20,50,10,0.55)"], 0, 0, 16, 16);
+}
+
 function drawIce(ctx: CanvasRenderingContext2D) {
   noise(ctx, 13, ICE);
   const diagonal = (color: string, x: number, y: number, len: number) => {
@@ -140,7 +175,11 @@ function drawIce(ctx: CanvasRenderingContext2D) {
   for (const [x, y, len] of [[3, 2, 4], [12, 11, 3]] as const) diagonal("#86b6ea", x, y, len);
 }
 
-/** One 16×16 drawer per block type, in `BLOCK` order (tile index = type − 1). */
+/** Atlas tiles past the per-type ones: faces that differ from their block's main tile. */
+export const TILE = { grassSide: BLOCK_TYPES, logTop: BLOCK_TYPES + 1 } as const;
+export const ATLAS_TILES = BLOCK_TYPES + 2;
+
+/** One 16×16 drawer per block type, in `BLOCK` order (tile index = type − 1), then the `TILE` extras. */
 const BLOCK_TILES: ((ctx: CanvasRenderingContext2D) => void)[] = [
   (ctx) => noise(ctx, 21, DIRT),
   drawStoneTile,
@@ -150,12 +189,17 @@ const BLOCK_TILES: ((ctx: CanvasRenderingContext2D) => void)[] = [
   drawBricksTile,
   drawBoneTile,
   drawSnowTile,
+  drawGrassTopTile,
+  drawLogTile,
+  drawLeavesTile,
+  drawGrassSideTile,
+  drawLogTopTile,
 ];
 
 /** Horizontal strip of block tiles. Nearest filtering and no mipmaps keep neighbouring tiles from bleeding. */
 function blockAtlas() {
-  const [c, ctx] = canvas(16 * BLOCK_TYPES, 16);
-  BLOCK_TILES.slice(0, BLOCK_TYPES).forEach((draw, i) => {
+  const [c, ctx] = canvas(16 * ATLAS_TILES, 16);
+  BLOCK_TILES.slice(0, ATLAS_TILES).forEach((draw, i) => {
     const [tile, tctx] = canvas(16, 16);
     draw(tctx);
     rect(tctx, "rgba(0,0,0,0.25)", 0, 15, 16, 1);

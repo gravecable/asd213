@@ -236,6 +236,17 @@ export function createTextures() {
     }
   }
 
+  // The winter map's floor.
+  const snowTop = canvas(16, 16);
+  drawSnowTile(snowTop[1]);
+  const snowSide = canvas(16, 16);
+  noise(snowSide[1], 3, DIRT);
+  const rs = rng(12);
+  for (let x = 0; x < 16; x++) {
+    const depth = 2 + Math.floor(rs() * 3);
+    for (let y = 0; y < depth; y++) rect(snowSide[1], pick(rs, SNOW), x, y, 1, 1);
+  }
+
   const stone = canvas(16, 16);
   noise(stone[1], 5, STONE);
   stone[1].strokeStyle = "rgba(0,0,0,0.18)";
@@ -259,6 +270,8 @@ export function createTextures() {
   return {
     grassTop: toTexture(grassTop[0]),
     grassSide: toTexture(grassSide[0]),
+    snowTop: toTexture(snowTop[0]),
+    snowSide: toTexture(snowSide[0]),
     dirt: toTexture(drawDirt(2), true),
     stone: toTexture(stone[0]),
     lava: toTexture(lava[0]),

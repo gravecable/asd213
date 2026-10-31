@@ -25,6 +25,8 @@ import {
   HIT_REACH,
   HOT_STREAK,
   HUB,
+  MAPS,
+  MAP_IDS,
   MAX_HEIGHT,
   MAX_HP,
   MAX_PLAYERS,
@@ -40,6 +42,7 @@ import {
   ROULETTE_MS,
   SKIN_IDS,
   SMALL_SIZE,
+  SPAWN_RADIUS,
   SPLEEF_LAYERS,
   SPRINT_SPEED,
   SPRINT_KNOCKBACK,
@@ -50,6 +53,7 @@ import {
   Voxels,
   WALK_SPEED,
   WS_PATH,
+  breakable,
   buffAt,
   buffCount,
   buffIndexAt,
@@ -76,6 +80,7 @@ import type {
   ClientMsg,
   GameMode,
   KillReason,
+  MapId,
   Phase,
   PlayerInfo,
   Role,
@@ -108,6 +113,7 @@ import {
   speedCredit,
 } from "./anticheat.ts";
 import type { AcConfig, ClientAddr, KbCredit, MoveCtx, Motion } from "./anticheat.ts";
+import { generateMap, seededRandom } from "./maps.ts";
 import { MobWorld } from "./mobs.ts";
 import type { Mob } from "./mobs.ts";
 import { Records } from "./records.ts";
@@ -253,6 +259,10 @@ export interface ServerOptions {
   mode?: GameMode;
   /** Fixed arena spawn points instead of the circle (tests). */
   spawnPoints?: (index: number, count: number) => { x: number; z: number; yaw: number };
+  /** Fixed arena map instead of a random one each round; "flat" keeps the island bare (tests). */
+  map?: MapId | "flat";
+  /** Fixed map seed, so a test can build the same map and know where everything is. */
+  mapSeed?: number;
   onViolation?: (v: Violation) => void;
   /** Daily records file; null keeps them in memory only. Default: PVP_RECORDS_FILE or data/records.json. */
   recordsFile?: string | null;
@@ -265,6 +275,8 @@ export interface ServerOptions {
 }
 
 const BREAK_COOLDOWN_MS = 120;
+/** Teams start in two groups this far from the centre. */
+const TEAM_SPAWN_R = 34;
 const PLACE_COOLDOWN_MS = 80;
 const LAVA_INTERVAL_MS = 500;
 /** The lava stops rising at this height. */
@@ -404,6 +416,8 @@ export class PvpServer {
   private readonly fixedBuffs: BuffId[] | null;
   private readonly fixedMode: GameMode | null;
   private readonly fixedSpawns: ServerOptions["spawnPoints"] | null;
+  private readonly fixedMap: MapId | "flat" | null;
+  private readonly mapSeed: number | null;
   private readonly onViolation: ((v: Violation) => void) | null;
   private readonly rangeMs: number;
   private readonly buildTtlMs: number;
@@ -415,6 +429,9 @@ export class PvpServer {
   private phaseStart = Date.now();
   private mode: GameMode = "classic";
   private arena: GameWorld = { w: "arena", vox: new Voxels(), changedAt: new Map() };
+  /** The round's map (null: a bare island), and the previous one, which never comes twice in a row. */
+  private mapId: MapId | null = null;
+  private lastMap: MapId | null = null;
   private hub: GameWorld = { w: "hub", vox: new Voxels(), changedAt: new Map() };
   /** Player-placed blocks in the hub's build area, and when each one vanishes. */
   private hubPlaced = new Map<number, number>();
@@ -493,6 +510,8 @@ export class PvpServer {
     this.fixedBuffs = opts.buffPlan ?? null;
     this.fixedMode = opts.mode ?? null;
     this.fixedSpawns = opts.spawnPoints ?? null;
+    this.fixedMap = opts.map ?? null;
+    this.mapSeed = opts.mapSeed ?? null;
     this.onViolation = opts.onViolation ?? null;
     this.rangeMs = opts.rangeMs ?? 30_000;
     this.buildTtlMs = opts.buildTtlMs ?? 60_000;
@@ -812,7 +831,7 @@ export class PvpServer {
       c.hubSpot = { x: c.x, y: c.y, z: c.z, yaw: c.yaw };
       c.watching = true;
       c.ready = false;
-      this.send(c, { t: "world", w: "arena", blocks: this.arena.vox.toQuads() });
+      this.send(c, this.arenaWorld());
       this.send(c, { t: "bags", bags: [...this.bags.values()] });
       this.sendRoundState(c);
       this.sendYou(c);
@@ -873,6 +892,7 @@ export class PvpServer {
     this.crumbleWarned = -1;
     this.setFloor(startRadius(mode));
     if (mode === "spleef") this.fillSpleef();
+    else this.buildMap(mode);
     this.deaths = [];
     this.setPhase("countdown");
     this.buffLog = [{ tick: this.tickSeq, buffs: [], sizes: new Map() }];
@@ -882,12 +902,13 @@ export class PvpServer {
     }
     const teams = this.assignTeams(ps, mode);
     this.teamGoal = TEAM_KILLS_PER_PLAYER * Math.max(1, ...[0, 1].map((k) => [...teams.values()].filter((v) => v === k).length));
-    const blocks = this.arena.vox.toQuads();
+    const world = JSON.stringify(this.arenaWorld());
     const dirt = mode === "sumo" || mode === "spleef" ? 0 : START_DIRT + (mode === "builders" ? BUILDERS_BONUS : 0);
     ps.forEach((p, i) => {
       this.leaveActivities(p);
       const team = teams.get(p.id) ?? null;
-      const s = this.fixedSpawns?.(i, ps.length) ?? this.startSpot(i, ps.length, offset, team);
+      const spot = this.fixedSpawns?.(i, ps.length) ?? this.startSpot(i, ps.length, offset, team);
+      const s = { ...spot, ...(this.mapId ? this.groundSpot(spot.x, spot.z) : { y: mode === "spleef" ? SPLEEF_LAYERS[1] + 1 : 0 }) };
       p.loc = "arena";
       p.watching = false;
       p.hubSpot = null;
@@ -915,13 +936,14 @@ export class PvpServer {
         nextRegenAt: 0,
       });
       p.stats = { damage: 0, crits: 0, blocks: 0 };
-      this.relocate(p, { x: s.x, y: mode === "spleef" ? SPLEEF_LAYERS[1] + 1 : 0, z: s.z, yaw: s.yaw });
-      this.send(p, { t: "world", w: "arena", blocks });
+      this.relocate(p, s);
+      this.sendRaw(p, world);
       this.send(p, { t: "bags", bags: [] });
       this.teleport(p, s.yaw);
       this.sendYou(p);
     });
-    this.notice(`Раунд начался · ${def.title} · ${plural(ps.length, "игрок", "игрока", "игроков")}`, def.color);
+    const map = this.mapId ? ` · ${MAPS[this.mapId].title}` : "";
+    this.notice(`Раунд начался · ${def.title}${map} · ${plural(ps.length, "игрок", "игрока", "игроков")}`, def.color);
     if (def.respawn) this.sendScore(true);
     this.broadcastRoster();
   }
@@ -960,8 +982,8 @@ export class PvpServer {
       const j = Math.floor(i / 2);
       const m = team === 0 ? Math.ceil(n / 2) : Math.floor(n / 2);
       const a = this.teamAngle(team, offset) + (j - (m - 1) / 2) * 0.22;
-      const x = Math.cos(a) * 34;
-      const z = Math.sin(a) * 34;
+      const x = Math.cos(a) * TEAM_SPAWN_R;
+      const z = Math.sin(a) * TEAM_SPAWN_R;
       this.teamOffset = offset;
       return { x, z, yaw: Math.atan2(x, z) };
     }
@@ -980,8 +1002,53 @@ export class PvpServer {
       }
   }
 
+  /** The round's map: a fresh layout of a theme other than last round's. Sumo and Spleef fight on
+   *  their bare platforms. */
+  private buildMap(mode: GameMode): void {
+    this.mapId = null;
+    if (mode === "sumo" || mode === "spleef" || this.fixedMap === "flat") return;
+    const pool = MAP_IDS.filter((m) => m !== this.lastMap);
+    const id = this.fixedMap ?? pool[Math.floor(Math.random() * pool.length)];
+    const started = performance.now();
+    const spawnR = mode === "teams" ? TEAM_SPAWN_R : SPAWN_RADIUS;
+    generateMap(this.arena.vox, id, { radius: this.floorR, spawnR, hill: mode === "koth" }, seededRandom(this.mapSeed ?? Math.floor(Math.random() * 2 ** 32)));
+    this.mapId = id;
+    this.lastMap = id;
+    const ms = Math.round(performance.now() - started);
+    console.log(`[pvp] map: ${MAPS[id].title}, ${this.arena.vox.filled.size} blocks, ${this.arena.vox.holes.size} holes (${ms} ms)`);
+  }
+
+  /** The arena as a client entering it needs it. */
+  private arenaWorld(): ServerMsg {
+    return { t: "world", w: "arena", blocks: this.arena.vox.toQuads(), holes: this.arena.vox.holeList() };
+  }
+
+  /** Where to put a player starting near x, z on the map: the closest low spot clear of holes. */
+  private groundSpot(x: number, z: number): { x: number; y: number; z: number } {
+    const w = this.arena.vox;
+    let best: { x: number; y: number; z: number } | null = null;
+    let bestCost = Infinity;
+    for (let dx = -4; dx <= 4; dx++)
+      for (let dz = -4; dz <= 4; dz++) {
+        const cx = Math.floor(x) + dx;
+        const cz = Math.floor(z) + dz;
+        const y = this.standAt(cx + 0.5, cz + 0.5);
+        if (y === null || y > 2) continue;
+        let edge = false;
+        for (let ex = -1; ex <= 1 && !edge; ex++) for (let ez = -1; ez <= 1 && !edge; ez++) edge = !w.floored(cx + ex, cz + ez);
+        if (edge) continue;
+        const cost = Math.hypot(cx + 0.5 - x, cz + 0.5 - z) + y;
+        if (cost < bestCost) {
+          bestCost = cost;
+          best = { x: cx + 0.5, y, z: cz + 0.5 };
+        }
+      }
+    return best ?? { x, y: this.standAt(x, z) ?? 0, z };
+  }
+
   private toLobby(): void {
     this.clearArena();
+    this.mapId = null;
     this.bags.clear();
     this.resetRoundEvents();
     this.buffPlan = [];
@@ -1096,6 +1163,7 @@ export class PvpServer {
       pointsWin: this.pointsWin,
       floor: this.floorR,
       winTeam: this.winTeam,
+      map: this.mapId,
     };
   }
 
@@ -1343,8 +1411,10 @@ export class PvpServer {
     if (killer && (killer === victim || this.sameTeam(killer, victim) || killer.role !== "player")) killer = null;
     if (killer) killer.kills++;
     // A bag that fell off the island is gone with its owner.
-    if (victim.dirt > 0 && reason !== "fall") {
-      const bag: BagInfo = { id: this.nextBagId++, x: r2(victim.x), y: this.groundBelow(this.arena, victim.x, victim.y, victim.z), z: r2(victim.z), dirt: victim.dirt };
+    const ground = this.groundBelow(this.arena, victim.x, victim.y, victim.z);
+    const overHole = ground === 0 && !this.arena.vox.floored(Math.floor(victim.x), Math.floor(victim.z));
+    if (victim.dirt > 0 && reason !== "fall" && !overHole) {
+      const bag: BagInfo = { id: this.nextBagId++, x: r2(victim.x), y: ground, z: r2(victim.z), dirt: victim.dirt };
       this.bags.set(bag.id, bag);
       this.sendTo(this.viewers("arena"), { t: "bags", bags: [...this.bags.values()] });
     }
@@ -1403,7 +1473,7 @@ export class PvpServer {
       this.leaveActivities(c);
       c.loc = "arena";
       c.hubSpot = null;
-      this.send(c, { t: "world", w: "arena", blocks: this.arena.vox.toQuads() });
+      this.send(c, this.arenaWorld());
       this.send(c, { t: "bags", bags: [...this.bags.values()] });
       this.sendRoundState(c);
     }
@@ -1430,7 +1500,7 @@ export class PvpServer {
       const x = r2(Math.cos(a) * d);
       const z = r2(Math.sin(a) * d);
       const y = this.standAt(x, z);
-      if (y === null) continue;
+      if (y === null || (this.mapId && y > 3)) continue;
       const far = Math.min(40, ...enemies.map((o) => Math.hypot(o.x - x, o.z - z)));
       if (far > bestFar) {
         bestFar = far;
@@ -2830,9 +2900,12 @@ export class PvpServer {
     return players.some((p) => p.x + hw > x && p.x - hw < x + 1 && p.z + hw > z && p.z - hw < z + 1 && p.y + PLAYER_HEIGHT - 0.1 > y && p.y + 0.5 < y + 1);
   }
 
+  /** A block needs a neighbour: another block, or floor under it or beside it (so a bridge can be
+   *  built out over a hole from its edge). */
   private supported(world: GameWorld, x: number, y: number, z: number): boolean {
     const w = world.vox;
-    return y === 0 || !!(w.get(x + 1, y, z) || w.get(x - 1, y, z) || w.get(x, y + 1, z) || w.get(x, y - 1, z) || w.get(x, y, z + 1) || w.get(x, y, z - 1));
+    if (y === 0 && (w.floored(x, z) || w.floored(x + 1, z) || w.floored(x - 1, z) || w.floored(x, z + 1) || w.floored(x, z - 1))) return true;
+    return !!(w.get(x + 1, y, z) || w.get(x - 1, y, z) || w.get(x, y + 1, z) || w.get(x, y - 1, z) || w.get(x, y, z + 1) || w.get(x, y, z - 1));
   }
 
   private onPlace(c: Client, x: number, y: number, z: number, now: number): void {
@@ -2871,7 +2944,7 @@ export class PvpServer {
     const w = hub ? this.hub : this.arena;
     if (hub) {
       if (!this.isWalker(c) || !Voxels.inBounds(x, y, z) || !this.hubPlaced.has(Voxels.index(x, y, z))) return;
-    } else if (this.phase !== "playing" || c.loc !== "arena" || !c.alive || !w.vox.get(x, y, z)) {
+    } else if (this.phase !== "playing" || c.loc !== "arena" || !c.alive || !breakable(w.vox.get(x, y, z))) {
       return;
     }
     if (!this.canReach(c, x, y, z)) return this.flag(c, "build", 1, "breaking out of reach");
@@ -2880,7 +2953,7 @@ export class PvpServer {
     c.lastActiveAt = now;
     if (hub) {
       this.hubPlaced.delete(Voxels.index(x, y, z));
-    } else if (this.mode !== "spleef") {
+    } else if (this.mode !== "spleef" && w.vox.get(x, y, z) === BLOCK.dirt) {
       c.dirt++;
       this.sendYou(c);
     }
@@ -2891,6 +2964,11 @@ export class PvpServer {
 
   private send(c: Client, msg: ServerMsg): void {
     if (c.ws.readyState === WebSocket.OPEN) c.ws.send(JSON.stringify(msg));
+  }
+
+  /** An already serialised message (the same big one for many clients). */
+  private sendRaw(c: Client, data: string): void {
+    if (c.ws.readyState === WebSocket.OPEN) c.ws.send(data);
   }
 
   private sendTo(clients: Client[], msg: ServerMsg): void {

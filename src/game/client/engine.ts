@@ -273,6 +273,7 @@ export class Engine {
   private lastShotAt = 0;
   private bombTickAt = 0;
   private floorMat: THREE.MeshLambertMaterial;
+  private floorSideMat: THREE.MeshLambertMaterial;
   /** Block meshes by chunk; `blocksDirty` rebuilds them all, `dirtyChunks` just those. */
   private blockMat: THREE.MeshLambertMaterial;
   private blockGroup = new THREE.Group();
@@ -426,13 +427,14 @@ export class Engine {
     this.scene.add(this.scenery.group, this.fireworks.mesh);
 
     this.floorMat = new THREE.MeshLambertMaterial({ map: this.tex.grassTop, vertexColors: true });
+    this.floorSideMat = new THREE.MeshLambertMaterial({ map: this.tex.grassSide });
     const top = new THREE.Mesh(this.floor.top, this.floorMat);
     const ringFloor = new THREE.Mesh(this.floor.ring, new THREE.MeshLambertMaterial({ map: this.tex.stone, vertexColors: true }));
     top.receiveShadow = ringFloor.receiveShadow = true;
     this.floorMeshes = [
       top,
       ringFloor,
-      new THREE.Mesh(this.floor.side, new THREE.MeshLambertMaterial({ map: this.tex.grassSide })),
+      new THREE.Mesh(this.floor.side, this.floorSideMat),
       new THREE.Mesh(this.floor.dirt, new THREE.MeshLambertMaterial({ map: this.tex.dirt })),
     ];
     this.scene.add(...this.floorMeshes);
@@ -1490,9 +1492,14 @@ export class Engine {
     this.sun.intensity = 1.9 * light;
     // Clouds ignore lights and fog: dim them with the scene, or they glow at night.
     (this.clouds.material as THREE.MeshBasicMaterial).color.setScalar(Math.max(0.18, light));
-    this.floorMat.map = mods.lava ? this.tex.lava : mods.ice ? this.tex.ice : this.tex.grassTop;
+    // The winter map's island is under snow.
+    const s = this.store.get();
+    const snowy = s.view === "arena" && s.map === "winter";
+    this.floorMat.map = mods.lava ? this.tex.lava : mods.ice ? this.tex.ice : snowy ? this.tex.snowTop : this.tex.grassTop;
     this.floorMat.emissive.set(mods.lava ? "#c2410c" : "#000000");
     this.floorMat.needsUpdate = true;
+    this.floorSideMat.map = snowy ? this.tex.snowSide : this.tex.grassSide;
+    this.floorSideMat.needsUpdate = true;
   }
 
   // ------------------------------------------------------------------ input

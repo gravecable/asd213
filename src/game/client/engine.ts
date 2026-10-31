@@ -2,6 +2,7 @@ import * as THREE from "three";
 import {
   ARENA_RADIUS,
   BLOCK,
+  breakable,
   BUFF_IDS,
   BUILD_REACH,
   CLOSE_BANNED,
@@ -45,7 +46,7 @@ import type { BagInfo, Body, BuffId, ClientMsg, GameMode, MobKind, PlayerInfo, S
 import { Avatar } from "./avatar";
 import { DamageNumbers, Explosions, Fireworks, Footprints, MeteorMarks, Particles } from "./effects";
 import { HubScene } from "./hub-scene";
-import { GeometryBuilder, applyFloorAo, buildBlockGeometry, buildFloor } from "./meshing";
+import { CHUNK_KEYS, GeometryBuilder, applyFloorAo, buildBlockGeometry, buildFloor, chunkKey } from "./meshing";
 import { Scenery } from "./scenery";
 import { sfx } from "./sound";
 import type { Spatial } from "./sound";
@@ -248,8 +249,11 @@ export class Engine {
   private world = new Voxels();
   private tex = createTextures();
   private floor = buildFloor();
-  /** Island radius the floor meshes were built for, and the meshes: top, stone ring, side, dirt. */
+  /** Island radius and holes (`holesVersion` bumps with every new set) the floor meshes were built
+   *  for, and the meshes: top, stone ring, side, dirt. */
   private floorBuiltR = ARENA_RADIUS;
+  private holesVersion = 0;
+  private floorBuiltHoles = 0;
   private floorMeshes: THREE.Mesh[] = [];
   /** Cells about to crumble flash red. */
   private crumbleMat = new THREE.MeshBasicMaterial({ color: "#ff1a1a", transparent: true, opacity: 0.6, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
@@ -269,7 +273,12 @@ export class Engine {
   private lastShotAt = 0;
   private bombTickAt = 0;
   private floorMat: THREE.MeshLambertMaterial;
-  private blockMesh: THREE.Mesh;
+  private floorSideMat: THREE.MeshLambertMaterial;
+  /** Block meshes by chunk; `blocksDirty` rebuilds them all, `dirtyChunks` just those. */
+  private blockMat: THREE.MeshLambertMaterial;
+  private blockGroup = new THREE.Group();
+  private blockChunks = new Map<number, THREE.Mesh>();
+  private dirtyChunks = new Set<number>();
   private blocksDirty = false;
   private floorAoDirty: "all" | [number, number][] = [];
   private ring: THREE.Mesh;
@@ -418,13 +427,14 @@ export class Engine {
     this.scene.add(this.scenery.group, this.fireworks.mesh);
 
     this.floorMat = new THREE.MeshLambertMaterial({ map: this.tex.grassTop, vertexColors: true });
+    this.floorSideMat = new THREE.MeshLambertMaterial({ map: this.tex.grassSide });
     const top = new THREE.Mesh(this.floor.top, this.floorMat);
     const ringFloor = new THREE.Mesh(this.floor.ring, new THREE.MeshLambertMaterial({ map: this.tex.stone, vertexColors: true }));
     top.receiveShadow = ringFloor.receiveShadow = true;
     this.floorMeshes = [
       top,
       ringFloor,
-      new THREE.Mesh(this.floor.side, new THREE.MeshLambertMaterial({ map: this.tex.grassSide })),
+      new THREE.Mesh(this.floor.side, this.floorSideMat),
       new THREE.Mesh(this.floor.dirt, new THREE.MeshLambertMaterial({ map: this.tex.dirt })),
     ];
     this.scene.add(...this.floorMeshes);
@@ -459,9 +469,8 @@ export class Engine {
     this.hillGroup.visible = false;
     this.scene.add(this.hillGroup);
 
-    this.blockMesh = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshLambertMaterial({ map: this.tex.blockAtlas, vertexColors: true }));
-    this.blockMesh.castShadow = this.blockMesh.receiveShadow = true;
-    this.scene.add(this.blockMesh);
+    this.blockMat = new THREE.MeshLambertMaterial({ map: this.tex.blockAtlas, vertexColors: true });
+    this.scene.add(this.blockGroup);
 
     const rt = ringTexture();
     rt.repeat.set(96, 1);
@@ -788,6 +797,7 @@ export class Engine {
           buffs: m.buffs,
           winTeam: m.winTeam,
           mode: m.mode,
+          map: m.map,
           winnerId: m.winner,
           winnerName: m.winnerName,
           pointsWin: m.pointsWin,
@@ -817,7 +827,7 @@ export class Engine {
         }
         break;
       case "world":
-        this.enterWorld(m.w, m.blocks);
+        this.enterWorld(m.w, m.blocks, m.holes ?? []);
         break;
       case "floor":
         this.onFloor(m, now);
@@ -869,7 +879,8 @@ export class Engine {
         if (m.w !== this.store.get().view) break;
         this.world.set(m.x, m.y, m.z, m.v);
         if (m.y === 0 && this.floorAoDirty !== "all") this.floorAoDirty.push([m.x, m.z]);
-        this.blocksDirty = true;
+        // Neighbouring chunks too: their faces and shading next to the block change with it.
+        for (let dx = -1; dx <= 1; dx++) for (let dz = -1; dz <= 1; dz++) this.dirtyChunks.add(chunkKey(m.x + dx, m.z + dz));
         const at = new THREE.Vector3(m.x + 0.5, m.y + 0.5, m.z + 0.5);
         if (m.v) {
           sfx.place(this.spatial(at));
@@ -1008,7 +1019,7 @@ export class Engine {
     this.blocksDirty = true;
     this.floorAoDirty = "all";
     // Debris over a sample of the fallen cells, a rumble and a shake.
-    const band = bandCells(prev, m.r);
+    const band = bandCells(prev, m.r).filter(([x, z]) => !this.world.holes.has(Voxels.cell(x, z)));
     let nearest: THREE.Vector3 | null = null;
     for (let n = 0; n < 30 && band.length; n++) {
       const [x, z] = band.splice(Math.floor(Math.random() * band.length), 1)[0];
@@ -1097,17 +1108,18 @@ export class Engine {
     const island = arena ? s.floor : ARENA_RADIUS;
     this.world.floorRadius = arena ? (spleef ? 0 : s.floor) : Infinity;
     const r = spleef ? 0 : island;
-    if (r !== this.floorBuiltR) {
+    if (r !== this.floorBuiltR || this.holesVersion !== this.floorBuiltHoles) {
       this.floorBuiltR = r;
+      this.floorBuiltHoles = this.holesVersion;
       const old = this.floor;
-      this.floor = buildFloor(r);
+      this.floor = buildFloor(r, this.world.holes);
       const [top, ring, side, dirt] = this.floorMeshes;
       top.geometry = this.floor.top;
       ring.geometry = this.floor.ring;
       side.geometry = this.floor.side;
       dirt.geometry = this.floor.dirt;
       for (const g of [old.top, old.ring, old.side, old.dirt]) g.dispose();
-      this.scenery.setIslandRadius(r);
+      this.scenery.setIsland(r, this.world.holes, this.holesVersion);
       this.floorAoDirty = "all";
       this.blocksDirty = true;
     }
@@ -1117,6 +1129,7 @@ export class Engine {
       this.crumbleKey = key;
       const g = new GeometryBuilder();
       for (const [x, z] of c ? bandCells(island, c.next) : []) {
+        if (this.world.holes.has(Voxels.cell(x, z))) continue;
         const y = spleef ? SPLEEF_LAYERS[1] + 1.02 : 0.02;
         g.quad(
           [
@@ -1138,10 +1151,12 @@ export class Engine {
   }
 
   /** The server moved us into another world (hub ↔ arena): start from a clean scene. */
-  private enterWorld(w: UiState["view"], blocks: number[]) {
+  private enterWorld(w: UiState["view"], blocks: number[], holes: number[]) {
     this.clearWorldObjects();
     this.world.clear();
     for (let i = 0; i + 3 < blocks.length; i += 4) this.world.set(blocks[i], blocks[i + 1], blocks[i + 2], blocks[i + 3]);
+    this.world.setHoles(holes);
+    this.holesVersion++;
     this.floorAoDirty = "all";
     this.blocksDirty = true;
     this.fireworks.clear();
@@ -1426,12 +1441,35 @@ export class Engine {
   }
 
   private rebuildBlocks() {
+    for (const key of this.blocksDirty ? CHUNK_KEYS : this.dirtyChunks) this.rebuildChunk(key);
     this.blocksDirty = false;
-    this.blockMesh.geometry.dispose();
-    this.blockMesh.geometry = buildBlockGeometry(this.world);
+    this.dirtyChunks.clear();
     const cells = this.floorAoDirty;
     if (cells === "all" || cells.length) applyFloorAo(this.floor, this.world, cells === "all" ? null : cells);
     this.floorAoDirty = [];
+  }
+
+  private rebuildChunk(key: number) {
+    const geo = buildBlockGeometry(this.world, key);
+    let mesh = this.blockChunks.get(key);
+    if (!geo.index?.count) {
+      geo.dispose();
+      if (!mesh) return;
+      this.blockGroup.remove(mesh);
+      mesh.geometry.dispose();
+      this.blockChunks.delete(key);
+      return;
+    }
+    if (mesh) {
+      mesh.geometry.dispose();
+      mesh.geometry = geo;
+      return;
+    }
+    mesh = new THREE.Mesh(geo, this.blockMat);
+    mesh.castShadow = mesh.receiveShadow = true;
+    mesh.matrixAutoUpdate = false;
+    this.blockGroup.add(mesh);
+    this.blockChunks.set(key, mesh);
   }
 
   /** Buff looks (fog, lava floor) belong to the arena round only. */
@@ -1454,9 +1492,14 @@ export class Engine {
     this.sun.intensity = 1.9 * light;
     // Clouds ignore lights and fog: dim them with the scene, or they glow at night.
     (this.clouds.material as THREE.MeshBasicMaterial).color.setScalar(Math.max(0.18, light));
-    this.floorMat.map = mods.lava ? this.tex.lava : mods.ice ? this.tex.ice : this.tex.grassTop;
+    // The winter map's island is under snow.
+    const s = this.store.get();
+    const snowy = s.view === "arena" && s.map === "winter";
+    this.floorMat.map = mods.lava ? this.tex.lava : mods.ice ? this.tex.ice : snowy ? this.tex.snowTop : this.tex.grassTop;
     this.floorMat.emissive.set(mods.lava ? "#c2410c" : "#000000");
     this.floorMat.needsUpdate = true;
+    this.floorSideMat.map = snowy ? this.tex.snowSide : this.tex.grassSide;
+    this.floorSideMat.needsUpdate = true;
   }
 
   // ------------------------------------------------------------------ input
@@ -1813,9 +1856,10 @@ export class Engine {
     this.send({ t: "place", x, y, z });
   }
 
-  /** In the hub only blocks players placed in the build area can go (they are all dirt). */
+  /** In the arena players break dirt and snow (the map's other blocks only go in blasts); in the hub
+   *  only the blocks they placed in the build area (they are all dirt). */
   private canBreak(b: VoxelHit) {
-    if (this.store.get().view === "arena") return true;
+    if (this.store.get().view === "arena") return breakable(this.world.get(b.x, b.y, b.z));
     return this.world.get(b.x, b.y, b.z) === BLOCK.dirt && inCellBox(b.x, b.z, HUB.build);
   }
 
@@ -2262,7 +2306,7 @@ export class Engine {
     this.clouds.position.x = ((t / 1000) * 0.8) % 60;
     this.scenery.update(t, this.camera.position);
 
-    if (this.blocksDirty) this.rebuildBlocks();
+    if (this.blocksDirty || this.dirtyChunks.size) this.rebuildBlocks();
     this.renderer.render(this.scene, this.camera);
     if (showHand) {
       this.renderer.autoClear = false;

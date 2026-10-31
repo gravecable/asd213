@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { BLOCK_TYPES } from "../shared";
+import type { ItemId } from "../shared";
 
 // Procedural 16×16 pixel-art textures, so the game ships without image assets.
 
@@ -285,6 +286,84 @@ export function createTextures() {
 /** Data URL of the dirt block, for HUD icons. */
 export function dirtIconUrl() {
   return drawDirt(21).toDataURL();
+}
+
+/** Pixels within a circle, shaded from a light spot at the top left. */
+function ball(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number, dark: string, mid: string, light: string) {
+  for (let y = 0; y < 16; y++)
+    for (let x = 0; x < 16; x++) {
+      const d = Math.hypot(x + 0.5 - cx, y + 0.5 - cy);
+      if (d > r) continue;
+      const lit = Math.hypot(x + 0.5 - (cx - r * 0.35), y + 0.5 - (cy - r * 0.35)) / r;
+      rect(ctx, d > r - 1 ? dark : lit < 0.45 ? light : mid, x, y, 1, 1);
+    }
+}
+
+/** TNT's side: red with a white band and the letters. */
+function drawTntSide(ctx: CanvasRenderingContext2D) {
+  noise(ctx, 111, ["#d7261e", "#c81e17", "#e03128", "#b91c1c"]);
+  rect(ctx, "#f1f1f1", 0, 5, 16, 6);
+  rect(ctx, "#2b2b2b", 0, 5, 16, 1);
+  rect(ctx, "#2b2b2b", 0, 10, 16, 1);
+  // T N T in 3×4 letters.
+  const px = (x: number, y: number) => rect(ctx, "#1f1f1f", x, y, 1, 1);
+  for (const ox of [2, 11]) {
+    for (let x = 0; x < 3; x++) px(ox + x, 6);
+    for (let y = 7; y < 10; y++) px(ox + 1, y);
+  }
+  for (let y = 6; y < 10; y++) {
+    px(6, y);
+    px(9, y);
+  }
+  px(7, 7);
+  px(8, 8);
+}
+
+function drawTntTop(ctx: CanvasRenderingContext2D) {
+  noise(ctx, 113, ["#d7261e", "#c81e17", "#b91c1c"]);
+  rect(ctx, "#cfcfcf", 4, 4, 8, 8);
+  rect(ctx, "#3f3f3f", 7, 7, 2, 2);
+}
+
+/** TNT's faces: [side, top]. */
+export function tntTextures() {
+  const side = canvas(16, 16);
+  drawTntSide(side[1]);
+  const top = canvas(16, 16);
+  drawTntTop(top[1]);
+  return [toTexture(side[0]), toTexture(top[0])];
+}
+
+const ITEM_ICONS: Record<ItemId, (ctx: CanvasRenderingContext2D) => void> = {
+  apple: (ctx) => {
+    ball(ctx, 8, 9.5, 5.6, "#a16207", "#facc15", "#fef08a");
+    rect(ctx, "#5b3a1a", 8, 2, 1, 3);
+    rect(ctx, "#4ade80", 9, 2, 3, 2);
+  },
+  pearl: (ctx) => {
+    ball(ctx, 8, 8, 5.6, "#042f2e", "#0f766e", "#5eead4");
+    rect(ctx, "#99f6e4", 6, 6, 2, 1);
+  },
+  shield: (ctx) => {
+    for (let y = 2; y < 15; y++) {
+      const w = y < 10 ? 6 : 6 - (y - 9);
+      for (let x = 8 - w; x < 8 + w; x++) rect(ctx, x === 8 - w || x === 8 + w - 1 || y === 2 ? "#9ca3af" : (x + y) % 4 ? "#a0703c" : "#8b5a2b", x, y, 1, 1);
+    }
+    rect(ctx, "#d1d5db", 7, 6, 2, 3);
+  },
+  snowball: (ctx) => ball(ctx, 8, 8, 5.2, "#94a3b8", "#e2e8f0", "#ffffff"),
+  tnt: (ctx) => {
+    drawTntSide(ctx);
+    rect(ctx, "rgba(0,0,0,0.25)", 0, 15, 16, 1);
+    rect(ctx, "rgba(0,0,0,0.25)", 15, 0, 1, 16);
+  },
+};
+
+/** Data URL of an item's 16×16 icon, for the HUD. */
+export function itemIconUrl(item: ItemId) {
+  const [c, ctx] = canvas(16, 16);
+  ITEM_ICONS[item](ctx);
+  return c.toDataURL();
 }
 
 export function ringTexture() {

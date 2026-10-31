@@ -75,7 +75,8 @@ after(() => servers.forEach((s) => s.close()));
 
 export async function startServer(opts: ServerOptions = {}): Promise<TestServer> {
   const violations: Violation[] = [];
-  const game = new PvpServer({ timeScale: 0.05, recordsFile: null, buffPlan: [], ...opts, anticheat: { maxConnPerIp: 0, ...opts.anticheat }, onViolation: (v) => violations.push(v) });
+  // A bare island unless a test asks for a map: most tests place players by coordinates.
+  const game = new PvpServer({ timeScale: 0.05, recordsFile: null, buffPlan: [], map: "flat", ...opts, anticheat: { maxConnPerIp: 0, ...opts.anticheat }, onViolation: (v) => violations.push(v) });
   const http = createServer();
   http.on("upgrade", (req, socket, head) => {
     if (!game.handleUpgrade(req, socket, head)) socket.destroy();
@@ -300,6 +301,8 @@ export class Bot {
       case "world":
         this.world.clear();
         for (let i = 0; i < m.blocks.length; i += 4) this.world.set(m.blocks[i], m.blocks[i + 1], m.blocks[i + 2], m.blocks[i + 3]);
+        this.world.setHoles(m.holes ?? []);
+        this.map = m.map ?? null;
         this.worldView = m.w;
         this.setFloor(this.floor);
         this.view.clear();

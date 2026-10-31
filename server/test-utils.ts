@@ -28,9 +28,12 @@ import {
 import type {
   Body,
   BuffId,
+  ChestInfo,
   ClientMsg,
   DailyRecords,
   GameMode,
+  ItemFx,
+  ItemId,
   MapId,
   MobKind,
   MoveInput,
@@ -144,6 +147,11 @@ export class Bot {
   mode: GameMode = "classic";
   /** The round's map, as the last `phase` said. */
   map: MapId | null = null;
+  /** Chest loot held, chests and lit TNT on the island, item effects seen. */
+  items: [ItemId, number][] = [];
+  chests: ChestInfo[] = [];
+  tnts: Extract<ServerMsg, { t: "tnt" }>["tnts"] = [];
+  fxs: { fx: ItemFx; id: number }[] = [];
   /** Mobs as drawn (hub only): interpolated like players. */
   mobs = new Map<number, { kind: MobKind; pos: Vec3; target: Vec3; hp: number; maxHp: number }>();
   arrows = 0;
@@ -387,6 +395,16 @@ export class Bot {
         this.alive = m.alive;
         this.watching = m.watching;
         this.respawnIn = m.respawnIn;
+        this.items = m.items;
+        break;
+      case "chests":
+        this.chests = m.chests;
+        break;
+      case "tnt":
+        this.tnts = m.tnts;
+        break;
+      case "fx":
+        this.fxs.push({ fx: m.fx, id: m.id });
         break;
       case "tp":
         this.log.push(`${Date.now()} tp n=${m.n} ${m.x.toFixed(2)},${m.y.toFixed(2)},${m.z.toFixed(2)}`);
@@ -508,6 +526,16 @@ export class Bot {
   breakBlock(x: number, y: number, z: number) {
     this.flushMove();
     this.send({ t: "break", x, y, z });
+  }
+
+  /** Uses an item along the current view (`at`: where a TNT goes). */
+  use(item: ItemId, at?: [number, number, number]) {
+    this.flushMove();
+    this.send({ t: "use", item, yaw: this.yaw, pitch: this.pitch, tk: this.lastTick, ...(at ? { at } : {}) });
+  }
+
+  count(item: ItemId): number {
+    return this.items.find(([i]) => i === item)?.[1] ?? 0;
   }
 
   /** The browser's pickPlayer: nearest drawn player under the crosshair. */

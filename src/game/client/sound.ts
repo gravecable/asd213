@@ -202,6 +202,45 @@ class Sfx {
     [660, 880, 1175].forEach((f, i) => this.tone({ f, dur: 0.12, vol: 0.16, delay: i * 0.06 }));
   }
 
+  // Chest items.
+  chestOpen(s?: Spatial) {
+    this.noise({ dur: 0.18, vol: 0.25, type: "bandpass", f: 400, f2: 900, q: 1.2 }, s);
+    [523, 784, 1046, 1568].forEach((f, i) => this.tone({ f, dur: 0.16, vol: 0.12, delay: 0.08 + i * 0.05 }, s));
+  }
+
+  eat(s?: Spatial) {
+    for (let i = 0; i < 3; i++) this.noise({ dur: 0.07, vol: 0.28, type: "bandpass", f: 1400 + i * 200, q: 2, delay: i * 0.11 }, s);
+    this.tone({ f: 660, f2: 990, dur: 0.25, vol: 0.12, delay: 0.35 }, s);
+  }
+
+  throwItem(s?: Spatial) {
+    this.noise({ dur: 0.16, vol: 0.18, type: "bandpass", f: 700, f2: 2600, q: 1.4 }, s);
+  }
+
+  shieldUp(s?: Spatial) {
+    this.tone({ type: "triangle", f: 300, f2: 600, dur: 0.18, vol: 0.18 }, s);
+    this.noise({ dur: 0.1, vol: 0.15, type: "highpass", f: 2500 }, s);
+  }
+
+  shieldBlock(s?: Spatial) {
+    this.tone({ type: "square", f: 880, f2: 660, dur: 0.18, vol: 0.12, lp: 3000 }, s);
+    this.tone({ f: 1320, dur: 0.3, vol: 0.1, delay: 0.01 }, s);
+    this.noise({ dur: 0.08, vol: 0.35, f: 2400 }, s);
+  }
+
+  pearl(s?: Spatial) {
+    this.tone({ f: 1400, f2: 300, dur: 0.35, vol: 0.18 }, s);
+    this.noise({ dur: 0.3, vol: 0.2, type: "bandpass", f: 3000, f2: 600, q: 2 }, s);
+  }
+
+  splash(s?: Spatial) {
+    this.noise({ dur: 0.12, vol: 0.3, type: "bandpass", f: 1800, f2: 700, q: 0.9 }, s);
+  }
+
+  fuse(s?: Spatial) {
+    this.noise({ dur: 0.9, vol: 0.14, type: "highpass", f: 3500, attack: 0.02 }, s);
+  }
+
   rouletteTick(progress: number) {
     this.tone({ type: "square", f: 900 + progress * 400, dur: 0.03, vol: 0.05, lp: 3000 });
   }

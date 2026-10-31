@@ -2,6 +2,7 @@ import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 import { WebSocketServer, WebSocket } from "ws";
 import {
+  APPLE_HEAL,
   ARENA_RADIUS,
   BLOCK,
   BUFF_IDS,
@@ -10,6 +11,7 @@ import {
   BUILDER_BONUS,
   BUILDERS_BONUS,
   CHAOS_CLASH,
+  CHEST_MAX,
   CLOSE_KICKED,
   CLOSE_OUTDATED,
   CRIT_MULTIPLIER,
@@ -25,6 +27,8 @@ import {
   HIT_REACH,
   HOT_STREAK,
   HUB,
+  ITEMS,
+  ITEM_IDS,
   MAPS,
   MAP_IDS,
   MAX_HEIGHT,
@@ -40,6 +44,7 @@ import {
   PLAYER_HEIGHT,
   PROTOCOL_VERSION,
   ROULETTE_MS,
+  SHIELD_MS,
   SKIN_IDS,
   SMALL_SIZE,
   SPAWN_RADIUS,
@@ -49,7 +54,11 @@ import {
   SPRINT_KNOCKBACK_UP,
   START_DIRT,
   TEAM_KILLS_PER_PLAYER,
+  THROWN,
+  THROW_GRAVITY,
+  THROW_SPEED,
   TICK_MS,
+  TNT_FUSE_MS,
   Voxels,
   WALK_SPEED,
   WS_PATH,
@@ -77,8 +86,11 @@ import type {
   BagInfo,
   BuffId,
   BuffMods,
+  ChestInfo,
   ClientMsg,
   GameMode,
+  ItemFx,
+  ItemId,
   KillReason,
   MapId,
   Phase,
@@ -168,6 +180,10 @@ interface Client {
   score: number;
   arrows: number;
   lastShotAt: number;
+  /** Chest loot held, in pickup order; a raised shield lasts until then (0: none). */
+  items: Map<ItemId, number>;
+  shieldUntil: number;
+  lastUseAt: number;
   /** When a dead player comes back (respawn modes); 0 if not. */
   respawnAt: number;
   /** Eliminated players' choice for the next buff. */
@@ -263,6 +279,10 @@ export interface ServerOptions {
   map?: MapId | "flat";
   /** Fixed map seed, so a test can build the same map and know where everything is. */
   mapSeed?: number;
+  /** Chests at these spots when a round on a map starts, and no others (tests). */
+  chestSpots?: { x: number; z: number }[];
+  /** What chests hold, in this order round and round, instead of a random pick (tests). */
+  loot?: ItemId[];
   onViolation?: (v: Violation) => void;
   /** Daily records file; null keeps them in memory only. Default: PVP_RECORDS_FILE or data/records.json. */
   recordsFile?: string | null;
@@ -275,6 +295,18 @@ export interface ServerOptions {
 }
 
 const BREAK_COOLDOWN_MS = 120;
+/** Chests at the start of a round on a map: a few, plus one per three players. */
+const CHESTS_START = 2;
+/** Chance weights of chest loot. */
+const LOOT_WEIGHTS: Record<ItemId, number> = { snowball: 30, apple: 22, pearl: 18, shield: 15, tnt: 15 };
+const USE_COOLDOWN_MS = 250;
+const SNOWBALL_KNOCKBACK = 6.5;
+/** A shield takes the damage and most of the push. */
+const SHIELD_KNOCKBACK = 0.35;
+const THROWN_LIFE_MS = 6000;
+const TNT_RADIUS = 3.5;
+const TNT_DAMAGE = 12;
+const TNT_BLOCKS = 2.4;
 /** Teams start in two groups this far from the centre. */
 const TEAM_SPAWN_R = 34;
 const PLACE_COOLDOWN_MS = 80;
@@ -418,6 +450,9 @@ export class PvpServer {
   private readonly fixedSpawns: ServerOptions["spawnPoints"] | null;
   private readonly fixedMap: MapId | "flat" | null;
   private readonly mapSeed: number | null;
+  private readonly chestSpots: { x: number; z: number }[] | null;
+  private readonly fixedLoot: ItemId[] | null;
+  private lootIndex = 0;
   private readonly onViolation: ((v: Violation) => void) | null;
   private readonly rangeMs: number;
   private readonly buildTtlMs: number;
@@ -449,6 +484,14 @@ export class PvpServer {
   private lastSweep = 0;
   private bags = new Map<number, BagInfo>();
   private nextBagId = 1;
+  private chests = new Map<number, ChestInfo>();
+  private nextChestId = 1;
+  private nextChestAt = 0;
+  /** Snowballs and pearls in flight. */
+  private thrown = new Map<number, { id: number; item: ItemId; x: number; y: number; z: number; vx: number; vy: number; vz: number; owner: number; bornAt: number }>();
+  private nextThrownId = 1;
+  private tnts = new Map<number, { id: number; x: number; y: number; z: number; at: number; owner: number }>();
+  private nextTntId = 1;
   /** Buffs of each slot: one, two in the Chaos finale. */
   private buffPlan: BuffId[][] = [];
   /** Buffs the round's mode allows. */
@@ -512,6 +555,8 @@ export class PvpServer {
     this.fixedSpawns = opts.spawnPoints ?? null;
     this.fixedMap = opts.map ?? null;
     this.mapSeed = opts.mapSeed ?? null;
+    this.chestSpots = opts.chestSpots ?? null;
+    this.fixedLoot = opts.loot?.length ? opts.loot : null;
     this.onViolation = opts.onViolation ?? null;
     this.rangeMs = opts.rangeMs ?? 30_000;
     this.buildTtlMs = opts.buildTtlMs ?? 60_000;
@@ -607,6 +652,9 @@ export class PvpServer {
       score: 0,
       arrows: 0,
       lastShotAt: 0,
+      items: new Map(),
+      shieldUntil: 0,
+      lastUseAt: 0,
       respawnAt: 0,
       buffVote: null,
       x: HUB.spawn.x,
@@ -707,6 +755,8 @@ export class PvpServer {
         return this.onShoot(c, m, now);
       case "buffVote":
         return this.onBuffVote(c, m.i);
+      case "use":
+        return this.onUse(c, m, now);
     }
   }
 
@@ -833,6 +883,7 @@ export class PvpServer {
       c.ready = false;
       this.send(c, this.arenaWorld());
       this.send(c, { t: "bags", bags: [...this.bags.values()] });
+      this.sendItemsState(c);
       this.sendRoundState(c);
       this.sendYou(c);
       return;
@@ -903,6 +954,7 @@ export class PvpServer {
     const teams = this.assignTeams(ps, mode);
     this.teamGoal = TEAM_KILLS_PER_PLAYER * Math.max(1, ...[0, 1].map((k) => [...teams.values()].filter((v) => v === k).length));
     const world = JSON.stringify(this.arenaWorld());
+    if (this.mapId) this.spawnChests(ps.length);
     const dirt = mode === "sumo" || mode === "spleef" ? 0 : START_DIRT + (mode === "builders" ? BUILDERS_BONUS : 0);
     ps.forEach((p, i) => {
       this.leaveActivities(p);
@@ -923,6 +975,8 @@ export class PvpServer {
         team,
         score: 0,
         arrows: 0,
+        items: new Map(),
+        shieldUntil: 0,
         respawnAt: 0,
         buffVote: null,
         dirt,
@@ -939,6 +993,7 @@ export class PvpServer {
       this.relocate(p, s);
       this.sendRaw(p, world);
       this.send(p, { t: "bags", bags: [] });
+      this.sendItemsState(p);
       this.teleport(p, s.yaw);
       this.sendYou(p);
     });
@@ -1087,6 +1142,10 @@ export class PvpServer {
     this.hill = null;
     this.contested = false;
     this.nextHillAt = 0;
+    this.chests.clear();
+    this.thrown.clear();
+    this.tnts.clear();
+    this.nextChestAt = 0;
     this.closeVote();
   }
 
@@ -1120,6 +1179,12 @@ export class PvpServer {
     const bags = this.bags.size;
     for (const [id, b] of this.bags) if (!cellInRing(Math.floor(b.x), Math.floor(b.z), r)) this.bags.delete(id);
     if (this.bags.size !== bags) this.sendTo(this.viewers("arena"), { t: "bags", bags: [...this.bags.values()] });
+    const chests = this.chests.size;
+    for (const [id, b] of this.chests) if (!cellInRing(Math.floor(b.x), Math.floor(b.z), r)) this.chests.delete(id);
+    if (this.chests.size !== chests) this.sendChests();
+    const tnts = this.tnts.size;
+    for (const [id, b] of this.tnts) if (!cellInRing(b.x, b.z, r)) this.tnts.delete(id);
+    if (this.tnts.size !== tnts) this.sendTnts(now);
     this.broadcast({ t: "floor", r, next: null, ms: 0 });
   }
 
@@ -1407,6 +1472,9 @@ export class PvpServer {
     victim.alive = false;
     victim.hp = 0;
     victim.arrows = 0;
+    victim.items.clear();
+    if (victim.shieldUntil) this.rosterDirty = true;
+    victim.shieldUntil = 0;
     this.deaths.push(victim.id);
     if (killer && (killer === victim || this.sameTeam(killer, victim) || killer.role !== "player")) killer = null;
     if (killer) killer.kills++;
@@ -1475,6 +1543,7 @@ export class PvpServer {
       c.hubSpot = null;
       this.send(c, this.arenaWorld());
       this.send(c, { t: "bags", bags: [...this.bags.values()] });
+      this.sendItemsState(c);
       this.sendRoundState(c);
     }
     c.watching = false;
@@ -1788,6 +1857,7 @@ export class PvpServer {
     }
 
     this.stepArrows(now);
+    this.itemsTick(now);
   }
 
   private swapWarn(): number {
@@ -1809,8 +1879,16 @@ export class PvpServer {
 
   /** A blast: damage and knockback falling off with distance, blocks around it gone. `doomed`
    *  (the bomb's holder) dies whatever the mode. */
-  private explode(x: number, y: number, z: number, r: number, maxDmg: number, blockR: number, kind: "bomb" | "meteor", credit: Client | null, now: number, doomed: Client | null = null): void {
+  private explode(x: number, y: number, z: number, r: number, maxDmg: number, blockR: number, kind: "bomb" | "meteor" | "tnt", credit: Client | null, now: number, doomed: Client | null = null): void {
     this.sendTo(this.viewers("arena"), { t: "boom", x: r2(x), y: r2(y), z: r2(z), r, kind });
+    // TNT caught in a blast goes off right after it.
+    let chained = false;
+    for (const t of this.tnts.values()) {
+      if (Math.hypot(t.x + 0.5 - x, t.y + 0.5 - y, t.z + 0.5 - z) > r + 1 || t.at <= now + 250) continue;
+      t.at = now + 250;
+      chained = true;
+    }
+    if (chained) this.sendTnts(now);
     const noDamage = MODES[this.mode].noDamage;
     for (const p of this.alivePlayers()) {
       const d = Math.hypot(p.x - x, p.y + 0.9 - y, p.z - z);
@@ -1886,6 +1964,7 @@ export class PvpServer {
   }
 
   private arrowHit(a: { vx: number; vz: number }, owner: Client | null, t: Client, now: number): void {
+    if (this.shieldBlocks(t, owner, a.vx, a.vz, 5, now)) return;
     const lethal = this.overtime || buffModifiers(this.currentBuffs, this.mode).damage >= MAX_HP;
     const dmg = MODES[this.mode].noDamage ? 0 : lethal ? t.hp : Math.min(t.hp, ARROW_DAMAGE);
     t.hp -= dmg;
@@ -2396,7 +2475,8 @@ export class PvpServer {
     if (!viewers.length) return;
     const mods = buffModifiers(this.phase === "playing" ? this.currentBuffs : null);
     const a = this.arenaArrows.size ? [...this.arenaArrows.values()].flatMap((x) => [x.id, r2(x.x), r2(x.y), r2(x.z), r2(x.vx), r2(x.vy), r2(x.vz)]) : null;
-    const tick = (p: number[]): ServerMsg => (a ? { t: "tick", s, p, a } : { t: "tick", s, p });
+    const j = this.thrown.size ? [...this.thrown.values()].flatMap((x) => [x.id, THROWN.indexOf(x.item), r2(x.x), r2(x.y), r2(x.z), r2(x.vx), r2(x.vy), r2(x.vz)]) : null;
+    const tick = (p: number[]): ServerMsg => ({ t: "tick", s, p, ...(a ? { a } : {}), ...(j ? { j } : {}) });
     if (!mods.night && !mods.invisible) {
       this.sendTo(viewers, tick(alive.flatMap(row)));
       return;
@@ -2719,6 +2799,11 @@ export class PvpServer {
     if (this.strikeProblem(c, t, m, now, this.arena)) return;
     if (this.sameTeam(c, t)) return this.hint(c, "Это союзник", now);
     const buffs = this.currentBuffs;
+    if (t.shieldUntil > now) {
+      const k = this.knock(c, t.x, t.z, buffModifiers(buffs, this.mode, t.size), this.sprintHit(c, now, buffModifiers(buffs, this.mode, c.size)));
+      this.shieldBlocks(t, c, k.kx, k.kz, Math.hypot(k.kx, k.kz), now);
+      return;
+    }
     const mods = buffModifiers(buffs, this.mode, c.size);
     const crit = this.isCrit(c, this.arena, now);
     const sprint = this.sprintHit(c, now, mods);
@@ -2982,7 +3067,7 @@ export class PvpServer {
 
   private sendYou(c: Client): void {
     const respawnIn = c.respawnAt ? Math.max(0, c.respawnAt - Date.now()) : 0;
-    this.send(c, { t: "you", hp: c.hp, maxHp: c.maxHp, dirt: c.dirt, arrows: c.arrows, alive: c.alive, role: c.role, watching: c.watching, respawnIn });
+    this.send(c, { t: "you", hp: c.hp, maxHp: c.maxHp, dirt: c.dirt, arrows: c.arrows, alive: c.alive, role: c.role, watching: c.watching, respawnIn, items: [...c.items] });
   }
 
   private broadcastRoster(): void {
@@ -3004,6 +3089,7 @@ export class PvpServer {
         size: c.size,
         maxHp: c.maxHp,
         score: c.score,
+        shield: c.shieldUntil > Date.now(),
       }));
     this.broadcast({ t: "roster", players });
   }

@@ -1,0 +1,15 @@
+import { BUILD_REACH, lookDir, raycastVoxels } from "../src/game/shared.ts";
+import { idle, lookAt, match, run, waitFor } from "./test-utils.ts";
+const { srv, bots } = await match({ timeScale: 0.2, spawnPoints: (i) => [{ x: 0.5, z: 0.5, yaw: 0 }, { x: 2.7, z: -1.5, yaw: 0 }][i], chestSpots: [{ x: 0.5, z: 0.5 }, { x: 2.7, z: -1.5 }], loot: ["tnt"] }, 2);
+const a = bots.find((b) => Math.hypot(b.body.pos.x - 0.5, b.body.pos.z - 0.5) < 1)!;
+const b = bots.find((x) => x !== a)!;
+await waitFor(() => a.count("tnt") === 1, 3000, "tnt");
+lookAt(a, { x: 0.5, y: 0, z: -0.8 });
+const hit = raycastVoxels(a.world, a.eye(), lookDir(a.yaw, a.pitch), BUILD_REACH)!;
+const cell: [number, number, number] = [hit.x + hit.nx, hit.y + hit.ny, hit.z + hit.nz];
+console.log("A at", a.body.pos, "TNT cell", cell);
+a.use("tnt", cell);
+await Promise.all(bots.map((x) => run(x, idle(x), 5000, () => false)));
+console.log("A hp", a.hp, "B hp", b.hp, "A hurts", JSON.stringify(a.hurts.filter((h) => h.id === a.id)), "A pos", a.body.pos);
+srv.close();
+process.exit(0);

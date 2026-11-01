@@ -1,5 +1,5 @@
 import { ARENA_RADIUS, makeTimings } from "../shared";
-import type { BuffId, DailyRecords, GameMode, KillReason, MapId, Phase, PlayerInfo, Role, RoundResult, SkinId, Timings, TrainStats, View } from "../shared";
+import type { BuffId, DailyRecords, GameMode, ItemId, KillReason, MapId, Phase, PlayerInfo, Role, RoundResult, SkinId, Timings, TrainStats, View } from "../shared";
 
 export type SpecMode = "free" | "first" | "third";
 
@@ -47,6 +47,9 @@ export interface UiState {
   maxHp: number;
   /** Bow arrows left (bows buff). */
   arrows: number;
+  /** Chest loot held (pickup order) and the one F uses. */
+  items: [ItemId, number][];
+  itemSel: ItemId | null;
   /** When we come back (respawn modes), 0 if not dead or not coming back. */
   respawnAt: number;
   /** Lava buff: height of the lava's surface, -1 without lava. */
@@ -131,6 +134,8 @@ export const initialUi = (): UiState => ({
   roulette: null,
   maxHp: 20,
   arrows: 0,
+  items: [],
+  itemSel: null,
   respawnAt: 0,
   lava: -1,
   bounty: null,

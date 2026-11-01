@@ -2,13 +2,13 @@
 
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { ReactNode } from "react";
-import { BUFFS, HILL_TARGET, HOT_STREAK, MAPS, MAX_HP, MAX_PLAYERS, MIN_PLAYERS, MODES, MODE_IDS, PLAYER_COLORS, SKINS, SKIN_IDS, buffAt, buffCount, buffIndexAt, roundClock } from "@/game/shared";
-import type { BuffId, GameMode, PlayerInfo, SkinId, TrainStats } from "@/game/shared";
+import { BUFFS, HILL_TARGET, HOT_STREAK, ITEMS, ITEM_IDS, MAPS, MAX_HP, MAX_PLAYERS, MIN_PLAYERS, MODES, MODE_IDS, PLAYER_COLORS, SKINS, SKIN_IDS, buffAt, buffCount, buffIndexAt, roundClock } from "@/game/shared";
+import type { BuffId, GameMode, ItemId, PlayerInfo, SkinId, TrainStats } from "@/game/shared";
 import { Engine, SENS_MAX, SENS_MIN } from "@/game/client/engine";
 import { createStore, initialUi } from "@/game/client/store";
 import type { UiState } from "@/game/client/store";
 import { hairFor, skinFaceUrl } from "@/game/client/skins";
-import { dirtIconUrl } from "@/game/client/textures";
+import { dirtIconUrl, itemIconUrl } from "@/game/client/textures";
 import { sfx } from "@/game/client/sound";
 import "./pvp.css";
 
@@ -81,11 +81,13 @@ const CONTROLS: [string, string][] = [
   ["ПКМ", "поставить землю"],
   ["Прыжок + удар", "крит ×1.5"],
   ["Q", "выстрел (баф «Луки»)"],
+  ["F", "предмет из сундука (арена)"],
+  ["1–5 / колесо", "выбрать предмет"],
   ["1 / 2 / 3", "голос за баф (выбывшим)"],
   ["V", "вид от 1-го / 3-го лица"],
   ["T", "смотреть арену / в лобби"],
   ["E", "гардероб"],
-  ["F", "вызвать на дуэль"],
+  ["F", "вызвать на дуэль (хаб)"],
   ["Y / N", "принять / отказать"],
   ["H", "помощь"],
   ["M", "звук вкл/выкл"],
@@ -1000,7 +1002,32 @@ function SpeakerIcon({ muted }: { muted: boolean }) {
   );
 }
 
-function Hud({ ui, dirtIcon, actions }: { ui: UiState; dirtIcon: string; actions: HudActions }) {
+/** Chest loot: a slot per item (keys 1–5), the chosen one lit, F to use it. */
+function Hotbar({ ui, icons }: { ui: UiState; icons: Record<ItemId, string> }) {
+  if (!ui.items.length) return null;
+  const sel = ui.itemSel ? ITEMS[ui.itemSel] : null;
+  return (
+    <div className="flex flex-col items-center gap-1">
+      {sel && (
+        <div className="pvp-outline bg-black/45 px-2 py-0.5 text-sm">
+          <b style={{ color: sel.color }}>{sel.title}</b> · {sel.hint} · <span className="pvp-key">F</span>
+        </div>
+      )}
+      <div className="flex items-center gap-1.5">
+        {ui.items.map(([id, n], i) => (
+          <div key={id} className={`pvp-slot relative flex items-center gap-1 !py-0.5 !pl-1 !pr-2 ${id === ui.itemSel ? "pvp-slot-on" : ""}`}>
+            <span className="absolute -top-2.5 left-0.5 text-xs text-white/75">{i + 1}</span>
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src={icons[id]} alt={ITEMS[id].title} className="h-8 w-8 [image-rendering:pixelated]" />
+            <span className="pvp-outline text-lg tabular-nums">{n}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function Hud({ ui, dirtIcon, itemIcons, actions }: { ui: UiState; dirtIcon: string; itemIcons: Record<ItemId, string>; actions: HudActions }) {
   const now = useNow(100);
   const arena = ui.view === "arena" || ui.watching;
   const playing = ui.phase === "playing" || ui.phase === "countdown";
@@ -1083,10 +1110,14 @@ function Hud({ ui, dirtIcon, actions }: { ui: UiState; dirtIcon: string; actions
               🏹 <b className="tabular-nums">{ui.arrows}</b> · <span className="pvp-key">Q</span> выстрел
             </div>
           )}
-          <div className="pvp-slot flex items-center gap-2">
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img src={dirtIcon} alt="" className="h-9 w-9 [image-rendering:pixelated]" />
-            <span className="pvp-outline text-2xl tabular-nums">{ui.dirt}</span>
+          {ui.players.find((p) => p.id === ui.myId)?.shield && <div className="pvp-badge border-sky-300 text-sky-200">Щит поднят: следующий удар не пройдёт</div>}
+          <div className="flex items-end gap-3">
+            <div className="pvp-slot flex items-center gap-2">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={dirtIcon} alt="" className="h-9 w-9 [image-rendering:pixelated]" />
+              <span className="pvp-outline text-2xl tabular-nums">{ui.dirt}</span>
+            </div>
+            <Hotbar ui={ui} icons={itemIcons} />
           </div>
         </div>
       )}
@@ -1131,6 +1162,7 @@ export default function PvpGame() {
   const engineRef = useRef<Engine | null>(null);
   const [store] = useState(() => createStore(initialUi()));
   const [dirtIcon] = useState(() => dirtIconUrl());
+  const [itemIcons] = useState(() => Object.fromEntries(ITEM_IDS.map((i) => [i, itemIconUrl(i)])) as Record<ItemId, string>);
   const ui = useSyncExternalStore(store.subscribe, store.get, store.get);
 
   useEffect(() => {
@@ -1173,7 +1205,7 @@ export default function PvpGame() {
           </Panel>
         </div>
       )}
-      {ui.conn === "open" && <Hud ui={ui} dirtIcon={dirtIcon} actions={actions} />}
+      {ui.conn === "open" && <Hud ui={ui} dirtIcon={dirtIcon} itemIcons={itemIcons} actions={actions} />}
     </div>
   );
 }

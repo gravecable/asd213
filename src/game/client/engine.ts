@@ -29,6 +29,8 @@ import {
   PROTOCOL_VERSION,
   SKIN_IDS,
   SPLEEF_LAYERS,
+  THROWN,
+  THROW_GRAVITY,
   SPRINT_TAP_MS,
   Voxels,
   WALK_SPEED,
@@ -42,7 +44,7 @@ import {
   roundClock,
   stepBody,
 } from "../shared";
-import type { BagInfo, Body, BuffId, ClientMsg, GameMode, MobKind, PlayerInfo, ServerMsg, SkinId, VoxelHit } from "../shared";
+import type { BagInfo, Body, BuffId, ChestInfo, ClientMsg, GameMode, ItemId, MobKind, PlayerInfo, ServerMsg, SkinId, VoxelHit } from "../shared";
 import { Avatar } from "./avatar";
 import { DamageNumbers, Explosions, Fireworks, Footprints, MeteorMarks, Particles } from "./effects";
 import { HubScene } from "./hub-scene";
@@ -53,7 +55,7 @@ import type { Spatial } from "./sound";
 import type { SpecMode, Store, UiState } from "./store";
 import { SWING_MS, createSwordModel, firstPersonMatrix, glintTime, setSwordStyle, swordStyle } from "./sword";
 import type { SwordStyle } from "./sword";
-import { createTextures, gridTexture, labelTexture, ringTexture, setLabelFont, setPixelFont } from "./textures";
+import { createTextures, gridTexture, labelTexture, ringTexture, setLabelFont, setPixelFont, tntTextures } from "./textures";
 
 /** Radians per mouse count at sensitivity 1×. */
 const MOUSE_SENS = 0.0023;
@@ -306,6 +308,23 @@ export class Engine {
   private arrows = new Map<number, { group: THREE.Group; vel: THREE.Vector3 }>();
   private dying: Avatar[] = [];
   private bags = new Map<number, { info: BagInfo; group: THREE.Group }>();
+  /** Chest items: chests on the island, snowballs and pearls in flight, lit TNT, raised shields. */
+  private chests = new Map<number, THREE.Group>();
+  private thrown = new Map<number, { mesh: THREE.Mesh; vel: THREE.Vector3 }>();
+  private tnts = new Map<number, { mesh: THREE.Mesh; mats: THREE.MeshLambertMaterial[]; endsAt: number }>();
+  private shields = new Map<number, THREE.Mesh>();
+  private itemGeo = { chest: new THREE.BoxGeometry(0.8, 0.55, 0.7), lid: new THREE.BoxGeometry(0.84, 0.2, 0.74), latch: new THREE.BoxGeometry(0.14, 0.2, 0.06), beam: new THREE.CylinderGeometry(0.08, 0.08, 7, 6, 1, true), ball: new THREE.SphereGeometry(0.13, 8, 6), tnt: new THREE.BoxGeometry(0.98, 0.98, 0.98), shield: new THREE.SphereGeometry(1, 20, 14) };
+  private itemMat = {
+    chest: new THREE.MeshLambertMaterial({ color: "#9a6532" }),
+    lid: new THREE.MeshLambertMaterial({ color: "#6f4520" }),
+    latch: new THREE.MeshLambertMaterial({ color: "#facc15", emissive: "#6b5200" }),
+    beam: new THREE.MeshBasicMaterial({ color: "#fde68a", transparent: true, opacity: 0.22, depthWrite: false, blending: THREE.AdditiveBlending, fog: false }),
+    snowball: new THREE.MeshLambertMaterial({ color: "#f8fafc", emissive: "#334155" }),
+    pearl: new THREE.MeshLambertMaterial({ color: "#0f766e", emissive: "#134e4a" }),
+    shield: new THREE.MeshBasicMaterial({ color: "#93c5fd", transparent: true, opacity: 0.16, depthWrite: false }),
+  };
+  private tntTex = tntTextures();
+  private lastUseAt = 0;
   private ws: WebSocket | null = null;
   private name = "";
   private keys = new Set<string>();
@@ -895,6 +914,7 @@ export class Engine {
         this.onTick(m.p);
         this.syncMobs(m.m ?? [], now);
         this.syncArrows(m.a ?? [], now);
+        this.syncThrown(m.j ?? []);
         break;
       case "you": {
         const s = this.store.get();
@@ -917,8 +937,18 @@ export class Engine {
           watching: m.watching,
           respawnAt: m.respawnIn ? now + m.respawnIn : 0,
         });
+        this.syncItems(m.items);
         break;
       }
+      case "chests":
+        this.syncChests(m.chests);
+        break;
+      case "tnt":
+        this.syncTnts(m.tnts, now);
+        break;
+      case "fx":
+        this.onItemFx(m, now);
+        break;
       case "tp":
         this.tpSeq = m.n;
         this.pos.set(m.x, m.y, m.z);
@@ -1188,6 +1218,11 @@ export class Engine {
     for (const a of this.arrows.values()) this.disposeGroup(a.group);
     this.arrows.clear();
     this.syncBags([]);
+    this.syncChests([]);
+    this.syncThrown([]);
+    this.syncTnts([], 0);
+    for (const m of this.shields.values()) this.scene.remove(m);
+    this.shields.clear();
     this.recentSwings.clear();
   }
 
@@ -1440,6 +1475,209 @@ export class Engine {
     }
   }
 
+  // ------------------------------------------------------------------ chest items
+
+  /** Keeps the chosen item while there is any of it, else picks the first one; a chime for new loot. */
+  private syncItems(items: [ItemId, number][]) {
+    const s = this.store.get();
+    const had = s.items.reduce((n, [, c]) => n + c, 0);
+    const has = items.reduce((n, [, c]) => n + c, 0);
+    if (has > had && s.alive) sfx.pickup();
+    const sel = items.some(([i]) => i === s.itemSel) ? s.itemSel : (items[0]?.[0] ?? null);
+    this.store.set({ items, itemSel: sel });
+  }
+
+  private selectItem(i: number) {
+    const item = this.store.get().items[i]?.[0];
+    if (item) this.store.set({ itemSel: item });
+  }
+
+  private cycleItem(d: number) {
+    const { items, itemSel } = this.store.get();
+    if (items.length < 2) return;
+    const i = items.findIndex(([id]) => id === itemSel);
+    this.store.set({ itemSel: items[(i + d + items.length) % items.length][0] });
+  }
+
+  /** F: the chosen item. Throwables fly along the view; TNT goes where a block would. */
+  private useItem() {
+    const s = this.store.get();
+    const item = s.itemSel;
+    const now = performance.now();
+    if (!item || s.phase !== "playing" || now - this.lastUseAt < 250) return;
+    let at: [number, number, number] | undefined;
+    if (item === "tnt") {
+      const { origin, dir } = this.eyeRay();
+      const hit = this.raycast(origin, dir, BUILD_REACH);
+      if (!hit) return;
+      const [x, y, z] = [hit.x + hit.nx, hit.y + hit.ny, hit.z + hit.nz];
+      if (!Voxels.inBounds(x, y, z) || this.world.get(x, y, z) || !cellInRing(x, z, s.floor)) return;
+      at = [x, y, z];
+    }
+    this.lastUseAt = now;
+    if (item === "snowball" || item === "pearl" || item === "tnt") this.swingArm(now);
+    this.flushMove();
+    this.send({ t: "use", item, yaw: this.yaw, pitch: this.pitch, tk: this.lastTick, ...(at ? { at } : {}) });
+  }
+
+  private syncChests(list: ChestInfo[]) {
+    const ids = new Set(list.map((c) => c.id));
+    for (const [id, g] of this.chests) {
+      if (ids.has(id)) continue;
+      this.scene.remove(g);
+      this.chests.delete(id);
+    }
+    for (const c of list) {
+      if (this.chests.has(c.id)) continue;
+      const g = new THREE.Group();
+      const body = new THREE.Mesh(this.itemGeo.chest, this.itemMat.chest);
+      const lid = new THREE.Mesh(this.itemGeo.lid, this.itemMat.lid);
+      const latch = new THREE.Mesh(this.itemGeo.latch, this.itemMat.latch);
+      const beam = new THREE.Mesh(this.itemGeo.beam, this.itemMat.beam);
+      body.position.y = 0.275;
+      lid.position.y = 0.6;
+      latch.position.set(0, 0.5, 0.38);
+      beam.position.y = 3.5;
+      body.castShadow = lid.castShadow = true;
+      g.add(body, lid, latch, beam);
+      g.position.set(c.x, c.y, c.z);
+      g.userData.baseY = c.y;
+      this.scene.add(g);
+      this.chests.set(c.id, g);
+    }
+  }
+
+  private syncThrown(rows: number[]) {
+    const seen = new Set<number>();
+    for (let i = 0; i + 7 < rows.length; i += 8) {
+      const id = rows[i];
+      seen.add(id);
+      let o = this.thrown.get(id);
+      if (!o) {
+        const mesh = new THREE.Mesh(this.itemGeo.ball, THROWN[rows[i + 1]] === "pearl" ? this.itemMat.pearl : this.itemMat.snowball);
+        o = { mesh, vel: new THREE.Vector3() };
+        this.thrown.set(id, o);
+        this.scene.add(mesh);
+      }
+      o.mesh.position.set(rows[i + 2], rows[i + 3], rows[i + 4]);
+      o.vel.set(rows[i + 5], rows[i + 6], rows[i + 7]);
+    }
+    for (const [id, o] of this.thrown) {
+      if (seen.has(id)) continue;
+      this.scene.remove(o.mesh);
+      this.thrown.delete(id);
+    }
+  }
+
+  private syncTnts(list: Extract<ServerMsg, { t: "tnt" }>["tnts"], now: number) {
+    const ids = new Set(list.map((t) => t.id));
+    for (const [id, o] of this.tnts) {
+      if (ids.has(id)) continue;
+      this.scene.remove(o.mesh);
+      for (const m of o.mats) m.dispose();
+      this.tnts.delete(id);
+    }
+    for (const t of list) {
+      const known = this.tnts.get(t.id);
+      if (known) {
+        known.endsAt = now + t.ms;
+        continue;
+      }
+      const [side, top] = this.tntTex;
+      const sideMat = new THREE.MeshLambertMaterial({ map: side });
+      const topMat = new THREE.MeshLambertMaterial({ map: top });
+      const mats = [sideMat, sideMat, topMat, topMat, sideMat, sideMat];
+      const mesh = new THREE.Mesh(this.itemGeo.tnt, mats);
+      mesh.position.set(t.x + 0.5, t.y + 0.49, t.z + 0.5);
+      mesh.castShadow = true;
+      this.scene.add(mesh);
+      this.tnts.set(t.id, { mesh, mats: [sideMat, topMat], endsAt: now + t.ms });
+      sfx.fuse(this.spatial(mesh.position));
+    }
+  }
+
+  private onItemFx(m: Extract<ServerMsg, { t: "fx" }>, now: number) {
+    if (this.store.get().view !== "arena") return;
+    const at = new THREE.Vector3(m.x, m.y, m.z);
+    const sp = this.spatial(at);
+    switch (m.fx) {
+      case "chest":
+        this.particles.burst(at, ["#facc15", "#fde68a", "#a16207"], 18, 5, 0.16);
+        sfx.chestOpen(sp);
+        break;
+      case "eat":
+        this.particles.burst(at, ["#facc15", "#fde047", "#fef9c3"], 10, 3, 0.12);
+        sfx.eat(sp);
+        break;
+      case "throw":
+        this.avatars.get(m.id)?.swing(now);
+        sfx.throwItem(sp);
+        break;
+      case "shield":
+        sfx.shieldUp(sp);
+        break;
+      case "block":
+        this.particles.burst(at, ["#e5e7eb", "#93c5fd", "#ffffff"], 12, 5, 0.12);
+        sfx.shieldBlock(sp);
+        break;
+      case "pearl":
+        this.particles.burst(at, ["#a855f7", "#2dd4bf", "#312e81"], 24, 4, 0.15);
+        sfx.pearl(sp);
+        break;
+      case "splash":
+        this.particles.burst(at, ["#ffffff", "#e0f2fe", "#cbd5e1"], 12, 4, 0.12);
+        sfx.splash(sp);
+        break;
+      case "fizzle":
+        this.particles.burst(at, ["#a855f7", "#4c1d95"], 8, 2, 0.12);
+        break;
+    }
+  }
+
+  /** Chests bob, thrown things fly on between ticks, TNT flashes faster as the fuse burns down,
+   *  shields wrap whoever holds one up (not our own first-person view). */
+  private updateItems(dt: number, t: number, third: boolean) {
+    for (const g of this.chests.values()) {
+      g.rotation.y += dt * 0.8;
+      g.position.y = g.userData.baseY + 0.05 + Math.sin(t / 400) * 0.05;
+    }
+    for (const o of this.thrown.values()) {
+      o.mesh.position.addScaledVector(o.vel, dt);
+      o.vel.y -= THROW_GRAVITY * dt;
+    }
+    for (const o of this.tnts.values()) {
+      const left = o.endsAt - t;
+      const on = Math.floor(t / (left < 1000 ? 80 : 220)) % 2 === 0;
+      for (const m of o.mats) m.emissive.setScalar(on ? 0.55 : 0);
+      o.mesh.scale.setScalar(left < 400 ? 1 + (1 - left / 400) * 0.15 : 1);
+    }
+    const s = this.store.get();
+    const holders = new Set(s.view === "arena" ? s.players.filter((p) => p.shield && p.alive).map((p) => p.id) : []);
+    if (!third && s.myId !== null) holders.delete(s.myId);
+    for (const [id, m] of this.shields) {
+      if (holders.has(id)) continue;
+      this.scene.remove(m);
+      this.shields.delete(id);
+    }
+    for (const id of holders) {
+      const a = id === s.myId ? this.selfAvatar : this.avatars.get(id);
+      let m = this.shields.get(id);
+      if (!a) {
+        if (m) m.visible = false;
+        continue;
+      }
+      if (!m) {
+        m = new THREE.Mesh(this.itemGeo.shield, this.itemMat.shield);
+        this.scene.add(m);
+        this.shields.set(id, m);
+      }
+      const size = s.players.find((p) => p.id === id)?.size ?? 1;
+      m.visible = a.group.visible;
+      m.position.set(a.group.position.x, a.group.position.y + 0.95 * size, a.group.position.z);
+      m.scale.setScalar(1.05 * size * (1 + Math.sin(t / 180) * 0.02));
+    }
+  }
+
   private rebuildBlocks() {
     for (const key of this.blocksDirty ? CHUNK_KEYS : this.dirtyChunks) this.rebuildChunk(key);
     this.blocksDirty = false;
@@ -1601,6 +1839,10 @@ export class Engine {
     if (e.code === "KeyV" && (mode === "play" || mode === "frozen")) this.thirdPerson = !this.thirdPerson;
     if (e.code === "KeyQ" && mode === "play" && s.view === "arena") this.shoot();
     if (/^Digit[123]$/.test(e.code) && s.vote && !s.alive) this.vote(Number(e.code.slice(5)) - 1);
+    if (s.view === "arena" && s.alive && mode === "play") {
+      if (e.code === "KeyF") this.useItem();
+      if (/^Digit[1-5]$/.test(e.code)) this.selectItem(Number(e.code.slice(5)) - 1);
+    }
     if (inHub) {
       if (e.code === "KeyE" && s.nearWardrobe && !this.inDuel()) this.setWardrobe(true);
       if (e.code === "KeyF" && s.duelTarget && !this.inDuel()) this.send({ t: "duel", id: s.duelTarget.id });
@@ -1657,6 +1899,7 @@ export class Engine {
 
   private onWheel = (e: WheelEvent) => {
     if (this.mode === "spectate") this.cycleTarget(e.deltaY > 0 ? 1 : -1);
+    else if (this.mode === "play" && this.store.get().view === "arena") this.cycleItem(e.deltaY > 0 ? 1 : -1);
   };
 
   /** Raw mouse input (Chromium): no OS acceleration, so the same hand movement always turns the
@@ -2272,6 +2515,7 @@ export class Engine {
       group.rotation.y += dt * 1.5;
       group.position.y = group.userData.baseY + Math.sin(t / 300) * 0.08;
     }
+    this.updateItems(dt, t, third);
     this.particles.update(stopped ? 0 : dt);
     this.updateCelebration(t, invisible);
     this.fireworks.update(stopped ? 0 : dt);
